@@ -173,6 +173,26 @@ local function installMobDropIndex()
     end
     mobIndexHooked = true
     hooksecurefunc("LootDB_AddChunk", indexChunk)
+
+    -- Merge our harvested Questie quest-drop data (fills quest-only drops LootDBLua omits, e.g.
+    -- Darksoul Shackle 3157 <- Moonrage Darksoul 1782). Percent -> chance (ten-thousandths). Only
+    -- seed where LootDBLua has nothing yet; LootDBLua's own data (loaded via the hook) then wins
+    -- for anything it covers.
+    if type(DropChanceTooltip_QuestieDrops) == "table" then
+        for itemID, npcs in pairs(DropChanceTooltip_QuestieDrops) do
+            for npcID, pct in pairs(npcs) do
+                local bucket = mobDropIndex[npcID]
+                if not bucket then
+                    bucket = {}
+                    mobDropIndex[npcID] = bucket
+                end
+                if bucket[itemID] == nil then
+                    bucket[itemID] = pct * 100
+                end
+            end
+        end
+    end
+
     -- Ensure the whole DB loads so the index fills (also auto-starts on PLAYER_ENTERING_WORLD).
     if LootDBLua and LootDBLua.StartPreload then
         LootDBLua.StartPreload()
@@ -897,11 +917,21 @@ local function normalizeMobDrop(raw)
         name, link = GetItemInfo(itemID)
     end
 
+    -- Fallback for items not in the local cache (GetItemInfo returns nil), e.g. quest-only drops
+    -- harvested from Questie. Also warm the cache so a later hover gets the real (colored) link.
+    name = raw.name or name
+    if not name and DropChanceTooltip_QuestieItemNames then
+        name = DropChanceTooltip_QuestieItemNames[itemID]
+    end
+    if not link and C_Item and C_Item.RequestLoadItemDataByID then
+        C_Item.RequestLoadItemDataByID(itemID)
+    end
+
     return {
         itemID = itemID,
         chance = chance,
         quality = quality,
-        name = raw.name or name,
+        name = name,
         link = link,
     }
 end
@@ -1404,6 +1434,7 @@ local function addMobDropDataToTooltip(tooltip)
             for _, drop in ipairs(questShown) do
                 tooltip:AddDoubleLine(getItemDisplayText(drop), chanceText(drop.chance), 1, 1, 1, 0.2, 1, 0.2)
             end
+            tooltip:AddLine(" ") -- visual break between Quest Items and Drops
         end
     end
 
@@ -1453,6 +1484,8 @@ local function addMobDropDataToTooltip(tooltip)
             -- "hidden": render nothing
         end
     end
+
+    tooltip:AddLine(" ") -- visual break after our drops block
 end
 
 local function getTooltipTitleText(tooltip)
@@ -2280,7 +2313,9 @@ local function runNpcDump(arg)
 
     out(string.format("npc %d: %d drops  (itemID | qN | class:sub | chance | name)", npcID, #list))
     for _, e in ipairs(list) do
-        local name = GetItemInfo(e.itemID) or "?"
+        local name = GetItemInfo(e.itemID)
+            or (DropChanceTooltip_QuestieItemNames and DropChanceTooltip_QuestieItemNames[e.itemID])
+            or "?"
         local q = LootDBLua and LootDBLua.GetItemQuality and LootDBLua.GetItemQuality(e.itemID)
         local classID, subID = getItemClassInfo(e.itemID)
         out(string.format("  %d | q%s | %s:%s | %s | %s",

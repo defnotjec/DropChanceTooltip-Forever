@@ -36,11 +36,20 @@ by astroVermilion), which must be installed alongside it.
 
 - **LootDBLua** (data dependency; kept as a separate, independent addon).
 
+## Quest-only drops (harvested data)
+
+LootDBLua (wowhead-derived) omits items that only drop while on-quest (e.g. Darksoul Shackle).
+We fill that gap with a **bundled** supplemental table harvested from QuestieDB's Forever drop
+tables — **no runtime Questie dependency**.
+
+- `Data/QuestieDrops.lua` is generated (item→npc drop %, plus item names). It is merged into the
+  mob-drop index at load, seeding only where LootDBLua has nothing.
+- **Re-run after QuestieDB updates:** `python3 tools/harvest_questie_drops.py` (regenerates the file
+  in place; it's committed so the addon needs no Python at runtime). The generated file is
+  auto-generated — do not edit it by hand.
+
 ## Roadmap
 
-- **Quest-only drops:** LootDBLua (wowhead-derived) omits items that only drop while on-quest, so
-  they can't be shown yet. Planned: harvest Questie's quest/npc drop data into our own bundled
-  supplemental table (build-time; no runtime Questie dependency).
 - Material aggregation: for common mats, show mob-type + level ranges (needs per-mob level/type
   data; planned via QuestieDB cross-reference, later migrated into a bundled DB).
 

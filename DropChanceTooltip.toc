@@ -6,6 +6,10 @@
 ## Dependencies: LootDBLua
 ## SavedVariables: DropChanceTooltipDB
 
+# Harvested quest-only drop data (regen with tools/harvest_questie_drops.py). Loads first so the
+# global is available when the main file merges it into the mob-drop index.
+Data\QuestieDrops.lua
+
 # Bindings.xml is auto-loaded from the addon folder by this client; do NOT list it here
 # (listing it double-loads and throws "Unrecognized XML: Binding" on login).
 DropChanceTooltip.lua

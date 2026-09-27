@@ -3,16 +3,193 @@ local ADDON_NAME = ...
 -- Forever/modern clients removed the global GetItemInfo in favour of C_Item.GetItemInfo (same
 -- return signature). Bind a local so every GetItemInfo(...) call in this file works on both.
 local GetItemInfo = GetItemInfo or (C_Item and C_Item.GetItemInfo)
+local GetItemInfoInstant = GetItemInfoInstant or (C_Item and C_Item.GetItemInfoInstant)
+local QUEST_ITEM_CLASS = (Enum and Enum.ItemClass and Enum.ItemClass.Questitem) or 12
+local GEM_ITEM_CLASS = (Enum and Enum.ItemClass and Enum.ItemClass.Gem) or 3
+local RECIPE_ITEM_CLASS = (Enum and Enum.ItemClass and Enum.ItemClass.Recipe) or 9
+
+-- Item class id via GetItemInfoInstant (instant/cached, no async wait). nil if unavailable.
+local function getItemClassID(itemID)
+    if not (itemID and GetItemInfoInstant) then return nil end
+    local _, _, _, _, _, classID = GetItemInfoInstant(itemID)
+    return classID
+end
+
+local function isQuestItem(itemID)
+    return getItemClassID(itemID) == QUEST_ITEM_CLASS
+end
+
+-- classID + subclassID (recipe/consumable subclass tells patterns vs enchants vs schematics, etc.)
+local function getItemClassInfo(itemID)
+    if not (itemID and GetItemInfoInstant) then return nil, nil end
+    local _, _, _, _, _, classID, subclassID = GetItemInfoInstant(itemID)
+    return classID, subclassID
+end
+
+-- Recipe subclass ids (stable across clients). Consumable class id.
+local RECIPE_SUB_LEATHERWORKING, RECIPE_SUB_TAILORING = 1, 2
+local RECIPE_SUB_ENGINEERING = 3
+local RECIPE_SUB_ENCHANTING = 8
+local CONSUMABLE_ITEM_CLASS = 0
+local CONSUMABLE_SUB_SCROLL = 4   -- confirmed on this client: "Scroll of X" = class 0, subclass 4
+
+-- Classic gems are NOT the retail Gem class (3) here -- they're Trade Goods (class 7, subclass
+-- "Other") mixed in with non-gems, so a class check can't isolate them. Use a curated id set of
+-- the vanilla drop/prospect gems instead (extend as needed).
+local GEM_ITEM_IDS = {
+    [774] = true,   -- Malachite
+    [818] = true,   -- Tigerseye
+    [1206] = true,  -- Moss Agate
+    [1210] = true,  -- Shadowgem
+    [1529] = true,  -- Jade
+    [1705] = true,  -- Lesser Moonstone
+    [3864] = true,  -- Citrine
+    [7909] = true,  -- Aquamarine
+    [7910] = true,  -- Star Ruby
+    [11754] = true, -- Black Diamond
+    [11382] = true, -- Blood of the Mountain
+    [12361] = true, -- Blue Sapphire
+    [12364] = true, -- Huge Emerald
+    [12363] = true, -- Arcane Crystal
+    [12799] = true, -- Large Opal
+    [12800] = true, -- Azerothian Diamond
+}
+
+-- Collapsible "various X" groups: label + rendering order. Everything not caught here that is
+-- quality>=3 is "notable" (shown individually) and white/grey is "commons" (main drops).
+local GROUP_META = {
+    gems       = { label = "Gems" },
+    patterns   = { label = "Various patterns" },
+    schematics = { label = "Various schematics" },
+    enchants   = { label = "Various enchants" },
+    recipes    = { label = "Various recipes" },
+    scrolls    = { label = "Various scrolls" },
+    greens     = { label = "Various greens" },
+}
+local GROUP_ORDER = { "gems", "patterns", "schematics", "enchants", "recipes", "scrolls", "greens" }
+
+-- Which bucket a drop belongs to: "quest" | "notable" | one of the GROUP_ORDER keys | "commons".
+local function groupKeyForDrop(drop)
+    local itemID = drop.itemID
+    local quality = drop.quality or 0
+    local classID, subclassID = getItemClassInfo(itemID)
+
+    if classID == QUEST_ITEM_CLASS then return "quest" end
+    if quality >= 3 then return "notable" end            -- blue/epic: always individual
+    if GEM_ITEM_IDS[itemID] or classID == GEM_ITEM_CLASS then return "gems" end
+    if classID == RECIPE_ITEM_CLASS then
+        if subclassID == RECIPE_SUB_LEATHERWORKING or subclassID == RECIPE_SUB_TAILORING then return "patterns" end
+        if subclassID == RECIPE_SUB_ENGINEERING then return "schematics" end
+        if subclassID == RECIPE_SUB_ENCHANTING then return "enchants" end
+        return "recipes"
+    end
+    if classID == CONSUMABLE_ITEM_CLASS and subclassID == CONSUMABLE_SUB_SCROLL then return "scrolls" end
+    if quality == 2 then return "greens" end
+    return "commons"
+end
+
+-- Effective display for a collapsible group. Shift (held) reveals everything (even hidden);
+-- otherwise per-group mode drives it, with the global expandAllVarious forcing expand.
+local function groupDisplayMode(key)
+    if IsShiftKeyDown() then return "expand" end
+    local modes = DropChanceTooltipDB and DropChanceTooltipDB.variousMode
+    local m = (modes and modes[key]) or "collapse"
+    if m == "hidden" then return "hidden" end
+    if m == "expand" or (DropChanceTooltipDB and DropChanceTooltipDB.expandAllVarious) then return "expand" end
+    return "collapse"
+end
+
+-- Active quest objective texts (lowercased). Used to show a quest-item drop only while the player is
+-- on a quest that needs it. Rebuilt lazily; marked dirty on QUEST_LOG_UPDATE.
+local activeQuestObjectives = {}
+local questObjectivesDirty = true
+
+local function refreshActiveQuestObjectives()
+    questObjectivesDirty = false
+    wipe(activeQuestObjectives)
+    if not (C_QuestLog and C_QuestLog.GetNumQuestLogEntries and C_QuestLog.GetInfo and C_QuestLog.GetQuestObjectives) then
+        return
+    end
+    local num = C_QuestLog.GetNumQuestLogEntries() or 0
+    for i = 1, num do
+        local info = C_QuestLog.GetInfo(i)
+        if info and not info.isHeader and info.questID then
+            local objectives = C_QuestLog.GetQuestObjectives(info.questID)
+            if objectives then
+                for _, obj in ipairs(objectives) do
+                    if obj and obj.text and obj.text ~= "" then
+                        activeQuestObjectives[obj.text:lower()] = true
+                    end
+                end
+            end
+        end
+    end
+end
+
+-- True if a quest-item drop matches an objective of a quest the player is currently on. Objective
+-- text looks like "Darksoul Shackle: 0/5", so we test whether it contains the item's name.
+local function isQuestDropRelevant(drop)
+    if questObjectivesDirty then refreshActiveQuestObjectives() end
+    local name = drop.name
+    if not name or name == "" then return false end
+    name = name:lower()
+    for objText in pairs(activeQuestObjectives) do
+        if objText:find(name, 1, true) then return true end
+    end
+    return false
+end
+
+-- Source->items reverse index for MOB tooltips. LootDBLua is item->sources only, so we observe
+-- its global LootDB_AddChunk (called as each chunk lazily loads / preloads) and derive
+-- npcSourceID -> { [itemID] = chance }. Only sourceType 0 (creatures/NPCs) is indexed. This never
+-- modifies LootDBLua. Assumes LootDBLua's type-0 sourceID == the game's npcID (verify in-game).
+local mobDropIndex = {}
+local mobIndexHooked = false
+
+local function indexChunk(quality, chunk, data)
+    if type(data) ~= "table" then return end
+    for itemID, triplets in pairs(data) do
+        if type(triplets) == "table" then
+            for i = 1, #triplets - 2, 3 do
+                local sType, sID, chance = triplets[i], triplets[i + 1], triplets[i + 2]
+                if sType == 0 and sID and chance then
+                    local bucket = mobDropIndex[sID]
+                    if not bucket then
+                        bucket = {}
+                        mobDropIndex[sID] = bucket
+                    end
+                    if not bucket[itemID] or chance > bucket[itemID] then
+                        bucket[itemID] = chance
+                    end
+                end
+            end
+        end
+    end
+end
+
+local function installMobDropIndex()
+    if mobIndexHooked or type(LootDB_AddChunk) ~= "function" then
+        return
+    end
+    mobIndexHooked = true
+    hooksecurefunc("LootDB_AddChunk", indexChunk)
+    -- Ensure the whole DB loads so the index fills (also auto-starts on PLAYER_ENTERING_WORLD).
+    if LootDBLua and LootDBLua.StartPreload then
+        LootDBLua.StartPreload()
+    end
+end
 
 local DropChanceTooltip = CreateFrame("Frame")
 DropChanceTooltip:RegisterEvent("ADDON_LOADED")
 DropChanceTooltip:RegisterEvent("MODIFIER_STATE_CHANGED")
+DropChanceTooltip:RegisterEvent("QUEST_LOG_UPDATE")
 
 local debugEnabled = false
 local modernHooksInstalled = false
 local settingsWindow
 local settingsPanel
 local settingsCategoryID
+local settingsCategory
 
 local defaultSettings = {
     enabled = true, -- master on/off for the tooltip additions (toggle via /dct or the keybind)
@@ -33,6 +210,22 @@ local defaultSettings = {
     },
     sourceCountDefault = 5,   -- used when the item's quality is unknown
     sourceExpandedCap = 30,   -- max rows shown while Shift is held
+    -- Mob tooltip: how many regular (non-quest) drops to list. Quest items are always shown in
+    -- full in their own section above these. Rare/epic are ordered first, so the cap keeps them.
+    mobDropCount = 10,        -- unshifted
+    mobDropExpandedCap = 25,  -- Shift held
+    -- Mob tooltip: hide drops below this % by default (blue/epic and quest items are always shown
+    -- regardless; Shift ignores the floor and reveals everything).
+    minDropChancePercent = 1.0,
+    -- Quest items: by default only show them on a mob when they match an objective of a quest you're
+    -- currently on. Override to always show them regardless.
+    alwaysShowQuestItems = false,
+    -- Per-group display for the collapsible "various X" categories: "collapse" | "expand" | "hidden".
+    variousMode = {
+        gems = "collapse", patterns = "collapse", schematics = "collapse",
+        enchants = "collapse", recipes = "collapse", scrolls = "collapse", greens = "collapse",
+    },
+    expandAllVarious = false,  -- persistent "always expand every various group"
     showItemByRarity = {
         [0] = true, -- Poor
         [1] = true, -- Common
@@ -55,7 +248,8 @@ local defaultSettings = {
     },
 }
 
-local rarityOrder = { 0, 1, 2, 3, 4, 5, 6, 7 }
+-- Rarity rows shown in the options panel (Poor..Epic). Legendary/Artifact/Heirloom omitted for now.
+local rarityOrder = { 0, 1, 2, 3, 4 }
 
 local rarityLabels = {
     [0] = ITEM_QUALITY0_DESC or "Poor",
@@ -77,6 +271,25 @@ local function ensureSettings()
     -- Master on/off defaults to ON when unset. Only an explicit toggle-off turns it false.
     if DropChanceTooltipDB.enabled == nil then
         DropChanceTooltipDB.enabled = defaultSettings.enabled
+    end
+
+    -- "Various X" group display modes (per category), default collapse.
+    if type(DropChanceTooltipDB.variousMode) ~= "table" then
+        DropChanceTooltipDB.variousMode = {}
+    end
+    for key in pairs(defaultSettings.variousMode) do
+        if DropChanceTooltipDB.variousMode[key] == nil then
+            DropChanceTooltipDB.variousMode[key] = defaultSettings.variousMode[key]
+        end
+    end
+    if DropChanceTooltipDB.expandAllVarious == nil then
+        DropChanceTooltipDB.expandAllVarious = defaultSettings.expandAllVarious
+    end
+    if DropChanceTooltipDB.minDropChancePercent == nil then
+        DropChanceTooltipDB.minDropChancePercent = defaultSettings.minDropChancePercent
+    end
+    if DropChanceTooltipDB.alwaysShowQuestItems == nil then
+        DropChanceTooltipDB.alwaysShowQuestItems = defaultSettings.alwaysShowQuestItems
     end
 
     if type(DropChanceTooltipDB.showItemByRarity) ~= "table" then
@@ -753,22 +966,26 @@ local function normalizeMobDrops(rawDrops)
 end
 
 local function getMobDrops(npcID)
+    -- Primary: our source->items reverse index (built from LootDBLua chunk data). The index is a
+    -- map { [itemID] = chance }, which normalizeMobDrops accepts directly (key=itemID, value=chance).
+    local indexed = mobDropIndex[npcID]
+    if indexed and next(indexed) then
+        local drops = normalizeMobDrops(indexed)
+        debugPrint(string.format("Mob lookup: index gave %d drops for npcID %d", drops and #drops or 0, npcID))
+        if drops then return drops end
+    end
+
+    -- Fallback: if a future LootDBLua ever exposes a source->items method, use it.
     local provider = getLootDBProvider()
-    if not provider then
-        debugPrint("Mob lookup: LootDB provider missing")
-        return nil
+    if provider then
+        local rawDrops = callMobDropGetter(provider, npcID)
+        if rawDrops then
+            return normalizeMobDrops(rawDrops)
+        end
     end
 
-    debugPrint(string.format("Mob lookup: fetching drops for npcID %d", npcID))
-    local rawDrops = callMobDropGetter(provider, npcID)
-    if not rawDrops then
-        debugPrint(string.format("Mob lookup: provider returned no drops for npcID %d", npcID))
-        return nil
-    end
-
-    local drops = normalizeMobDrops(rawDrops)
-    debugPrint(string.format("Mob lookup: normalized %d drops for npcID %d", drops and #drops or 0, npcID))
-    return drops
+    debugPrint(string.format("Mob lookup: no drops for npcID %d (index size=%d)", npcID, mobDropIndex[npcID] and 1 or 0))
+    return nil
 end
 
 local function getObjectDrops(objectID)
@@ -1099,41 +1316,142 @@ local function addMobDropDataToTooltip(tooltip)
         return
     end
 
-    local npcID = getNPCIDFromTooltip(tooltip)
-    if not npcID then
-        debugPrint("Mob tooltip hover: no npcID found")
+    -- Open-world only. Instance boss loot tables carry 15+ relevant items and would be noise;
+    -- instances can be handled separately later.
+    if IsInInstance and IsInInstance() then
         return
     end
 
-    debugPrint(string.format("Mob tooltip hover: npcID=%d", npcID))
+    local npcID = getNPCIDFromTooltip(tooltip)
+    if not npcID then
+        return
+    end
 
-    local signature = string.format("mob:%d", npcID)
+    local signature = string.format("mob:%d:%s", npcID, IsShiftKeyDown() and "1" or "0")
     if tooltip.__dctMobSignature == signature then
         return
     end
 
     local drops = getMobDrops(npcID)
     if not drops or #drops == 0 then
-        debugPrint(string.format("Mob tooltip hover: no drops shown for npcID %d", npcID))
-        tooltip.__dctMobSignature = signature
+        -- Only cache "no drops" once the reverse index is fully built; otherwise a hover during
+        -- preload would stick as empty and never retry. Leave uncached while chunks are pending.
+        local stats = LootDBLua and LootDBLua.GetStats and LootDBLua.GetStats()
+        local ready = stats and (stats.pendingChunkCount or 0) == 0 and (stats.queuedChunkCount or 0) == 0
+        if ready then
+            tooltip.__dctMobSignature = signature
+        end
         return
     end
-
-    debugPrint(string.format("Mob tooltip hover: displaying %d drops for npcID %d", #drops, npcID))
-
     tooltip.__dctMobSignature = signature
-    tooltip:AddLine(" ")
-    tooltip:AddLine("Drops:", 0.80, 0.80, 0.80)
 
-    local maxDrops = math.min(#drops, 15)
-    for i = 1, maxDrops do
-        local drop = drops[i]
-        local chanceLabel = drop.chance and formatChance(drop.chance) or "--"
-        tooltip:AddDoubleLine(getItemDisplayText(drop), chanceLabel, 1, 1, 1, 0.2, 1, 0.2)
+    local expanded = IsShiftKeyDown()
+
+    -- Bucket every drop. quest -> own section; notable (blue/epic) + commons (white/grey) show
+    -- individually; everything else falls into a collapsible "various X" group (gems, patterns,
+    -- schematics, enchants, recipes, scrolls, greens) whose display is per-group configurable.
+    -- Minimum-chance floor (percent). It applies ONLY to the individually-listed main "commons" so
+    -- they don't fill with junk. The "various X" groups deliberately hold the low-% stuff (that is why
+    -- they are collapsible) and are governed by their per-group show/hide instead. Quest + notable are
+    -- always kept. Shift ignores the floor.
+    local minPct = (DropChanceTooltipDB and DropChanceTooltipDB.minDropChancePercent) or defaultSettings.minDropChancePercent
+    local minChanceRaw = (tonumber(minPct) or 0) * 100  -- chance is in ten-thousandths; percent = chance/100
+
+    local buckets = { quest = {}, notable = {}, commons = {} }
+    for _, key in ipairs(GROUP_ORDER) do buckets[key] = {} end
+    for _, drop in ipairs(drops) do
+        local key = groupKeyForDrop(drop)
+        if key == "commons" and not expanded and (drop.chance or 0) < minChanceRaw then
+            -- pruned by the % floor (commons only)
+        else
+            local list = buckets[key] or buckets.commons
+            list[#list + 1] = drop
+        end
     end
 
-    if #drops > maxDrops then
-        tooltip:AddLine(string.format("and %d more drops", #drops - maxDrops), 0.70, 0.70, 0.70)
+    local byChance = function(a, b) return (a.chance or 0) > (b.chance or 0) end
+    for _, list in pairs(buckets) do table.sort(list, byChance) end
+    table.sort(buckets.notable, function(a, b)
+        local qa, qb = a.quality or 0, b.quality or 0
+        if qa ~= qb then return qa > qb end
+        return (a.chance or 0) > (b.chance or 0)
+    end)
+
+    local function sumChance(list)
+        local s = 0
+        for _, d in ipairs(list) do s = s + (d.chance or 0) end
+        return math.min(s, 10000)
+    end
+    local function chanceText(chance)
+        return chance and formatChance(chance) or "--"
+    end
+
+    tooltip:AddLine(" ")
+
+    -- Quest items (own section). By default only shown when the drop matches an objective of a quest
+    -- the player is currently on; the alwaysShowQuestItems override (or Shift) shows them regardless.
+    if #buckets.quest > 0 then
+        local alwaysShow = expanded
+            or (DropChanceTooltipDB and DropChanceTooltipDB.alwaysShowQuestItems)
+        local questShown = {}
+        for _, drop in ipairs(buckets.quest) do
+            if alwaysShow or isQuestDropRelevant(drop) then
+                questShown[#questShown + 1] = drop
+            end
+        end
+        if #questShown > 0 then
+            tooltip:AddLine("Quest Items:", 1, 0.82, 0)
+            for _, drop in ipairs(questShown) do
+                tooltip:AddDoubleLine(getItemDisplayText(drop), chanceText(drop.chance), 1, 1, 1, 0.2, 1, 0.2)
+            end
+        end
+    end
+
+    tooltip:AddLine("Drops:", 0.80, 0.80, 0.80)
+
+    -- Notable (blue/epic) -- always, first, colored by the item link
+    for _, drop in ipairs(buckets.notable) do
+        tooltip:AddDoubleLine(getItemDisplayText(drop), chanceText(drop.chance), 1, 1, 1, 0.2, 1, 0.2)
+    end
+
+    -- Main common drops -- top-N by chance (Shift raises the cap)
+    local commons = buckets.commons
+    local cap = expanded
+        and ((DropChanceTooltipDB and DropChanceTooltipDB.mobDropExpandedCap) or defaultSettings.mobDropExpandedCap)
+        or ((DropChanceTooltipDB and DropChanceTooltipDB.mobDropCount) or defaultSettings.mobDropCount)
+    local shownCommons = math.min(#commons, cap)
+    for i = 1, shownCommons do
+        tooltip:AddDoubleLine(getItemDisplayText(commons[i]), chanceText(commons[i].chance), 1, 1, 1, 0.2, 1, 0.2)
+    end
+    if #commons > shownCommons then
+        tooltip:AddLine(string.format("+ %d more common drops%s", #commons - shownCommons,
+            expanded and "" or " |cff9f9f9f«|r|cff7f7f7fShift|r|cff9f9f9f»|r"), 0.6, 0.6, 0.6)
+    end
+
+    -- Collapsible "various X" groups, each per-group configurable (collapse / expand / hidden).
+    for _, key in ipairs(GROUP_ORDER) do
+        local list = buckets[key]
+        if list and #list > 0 then
+            local mode = groupDisplayMode(key)
+            if mode == "expand" then
+                for _, drop in ipairs(list) do
+                    tooltip:AddDoubleLine(getItemDisplayText(drop), chanceText(drop.chance), 1, 1, 1, 0.2, 1, 0.2)
+                end
+            elseif mode == "collapse" then
+                local label
+                if key == "gems" and #list <= 4 then
+                    local names = {}
+                    for _, d in ipairs(list) do names[#names + 1] = d.name or ("item:" .. tostring(d.itemID)) end
+                    label = "Gems: " .. table.concat(names, ", ")
+                else
+                    label = string.format("%s (%d)", GROUP_META[key].label, #list)
+                end
+                tooltip:AddDoubleLine(label,
+                    "~" .. chanceText(sumChance(list)) .. " |cff9f9f9f«|r|cff7f7f7fShift|r|cff9f9f9f»|r",
+                    0.1, 1, 0.1, 0.1, 1, 0.1)
+            end
+            -- "hidden": render nothing
+        end
     end
 end
 
@@ -1508,7 +1826,8 @@ local function createSettingsWindow()
         itemLabel:SetPoint("LEFT", itemCheck, "RIGHT", 2, 1)
         itemLabel:SetText(rarityLabels[rarity] or string.format("Rarity %d", rarity))
         if not previousItem then
-            itemCheck:SetPoint("TOPLEFT", itemFilterCheck, "BOTTOMLEFT", 0, -8)
+            -- Indent the rarity rows so they read as children of the Enable toggle above.
+            itemCheck:SetPoint("TOPLEFT", itemFilterCheck, "BOTTOMLEFT", 16, -8)
         else
             itemCheck:SetPoint("TOPLEFT", previousItem, "BOTTOMLEFT", 0, -4)
         end
@@ -1536,7 +1855,7 @@ local function createSettingsWindow()
         mobLabel:SetPoint("LEFT", mobCheck, "RIGHT", 2, 1)
         mobLabel:SetText(rarityLabels[rarity] or string.format("Rarity %d", rarity))
         if not previousMob then
-            mobCheck:SetPoint("TOPLEFT", mobFilterCheck, "BOTTOMLEFT", 0, -8)
+            mobCheck:SetPoint("TOPLEFT", mobFilterCheck, "BOTTOMLEFT", 16, -8)
         else
             mobCheck:SetPoint("TOPLEFT", previousMob, "BOTTOMLEFT", 0, -4)
         end
@@ -1638,7 +1957,8 @@ local function createSettingsPanel()
         setCheckButtonLabel(itemCheck, rarityLabels[rarity] or string.format("Rarity %d", rarity))
 
         if not previousItem then
-            itemCheck:SetPoint("TOPLEFT", itemFilterCheck, "BOTTOMLEFT", 0, -8)
+            -- Indent the rarity rows so they read as children of the Enable toggle above.
+            itemCheck:SetPoint("TOPLEFT", itemFilterCheck, "BOTTOMLEFT", 16, -8)
         else
             itemCheck:SetPoint("TOPLEFT", previousItem, "BOTTOMLEFT", 0, -4)
         end
@@ -1656,7 +1976,7 @@ local function createSettingsPanel()
         setCheckButtonLabel(mobCheck, rarityLabels[rarity] or string.format("Rarity %d", rarity))
 
         if not previousMob then
-            mobCheck:SetPoint("TOPLEFT", mobFilterCheck, "BOTTOMLEFT", 0, -8)
+            mobCheck:SetPoint("TOPLEFT", mobFilterCheck, "BOTTOMLEFT", 16, -8)
         else
             mobCheck:SetPoint("TOPLEFT", previousMob, "BOTTOMLEFT", 0, -4)
         end
@@ -1669,6 +1989,86 @@ local function createSettingsPanel()
         panel.mobCheckboxes[rarity] = mobCheck
         previousMob = mobCheck
     end
+
+    -- ---- Mob tooltip: "various X" groups + drop-chance floor (third column) ------------------
+    local variousSubtitle = panel:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+    variousSubtitle:SetPoint("TOPLEFT", title, "BOTTOMLEFT", 400, -8)
+    variousSubtitle:SetText("Mob tooltips: groups")
+
+    local questAlwaysCheck = CreateFrame("CheckButton", nil, panel, "InterfaceOptionsCheckButtonTemplate")
+    questAlwaysCheck:SetPoint("TOPLEFT", variousSubtitle, "BOTTOMLEFT", 0, -6)
+    setCheckButtonLabel(questAlwaysCheck, "Always show quest items")
+    questAlwaysCheck:SetScript("OnClick", function(self)
+        ensureSettings()
+        DropChanceTooltipDB.alwaysShowQuestItems = self:GetChecked() and true or false
+    end)
+    panel.questAlwaysCheck = questAlwaysCheck
+
+    local expandAllCheck = CreateFrame("CheckButton", nil, panel, "InterfaceOptionsCheckButtonTemplate")
+    expandAllCheck:SetPoint("TOPLEFT", questAlwaysCheck, "BOTTOMLEFT", 0, -6)
+    setCheckButtonLabel(expandAllCheck, "Expand all groups")
+    expandAllCheck:SetScript("OnClick", function(self)
+        ensureSettings()
+        DropChanceTooltipDB.expandAllVarious = self:GetChecked() and true or false
+    end)
+    panel.expandAllCheck = expandAllCheck
+
+    -- Per-group: Show (off = hidden) + Expand (on = list individually, off = collapse to one line).
+    -- Indented under Expand-all to read as its detail rows.
+    panel.groupShow = {}
+    panel.groupExpand = {}
+    local prevGroup
+    for _, key in ipairs(GROUP_ORDER) do
+        local shortLabel = GROUP_META[key].label:gsub("^Various ", "")
+        local showCheck = CreateFrame("CheckButton", nil, panel, "InterfaceOptionsCheckButtonTemplate")
+        showCheck.groupKey = key
+        setCheckButtonLabel(showCheck, shortLabel)
+        if not prevGroup then
+            showCheck:SetPoint("TOPLEFT", expandAllCheck, "BOTTOMLEFT", 16, -6)
+        else
+            showCheck:SetPoint("TOPLEFT", prevGroup, "BOTTOMLEFT", 0, -4)
+        end
+
+        local expandCheck = CreateFrame("CheckButton", nil, panel, "InterfaceOptionsCheckButtonTemplate")
+        expandCheck.groupKey = key
+        setCheckButtonLabel(expandCheck, "exp")
+        expandCheck:SetPoint("LEFT", showCheck, "LEFT", 140, 0)
+
+        local function writeMode()
+            ensureSettings()
+            if not showCheck:GetChecked() then
+                DropChanceTooltipDB.variousMode[key] = "hidden"
+            elseif expandCheck:GetChecked() then
+                DropChanceTooltipDB.variousMode[key] = "expand"
+            else
+                DropChanceTooltipDB.variousMode[key] = "collapse"
+            end
+            expandCheck:SetEnabled(showCheck:GetChecked())
+        end
+        showCheck:SetScript("OnClick", writeMode)
+        expandCheck:SetScript("OnClick", writeMode)
+
+        panel.groupShow[key] = showCheck
+        panel.groupExpand[key] = expandCheck
+        prevGroup = showCheck
+    end
+
+    -- Drop-chance floor slider at the BOTTOM of the column (below the group rows).
+    local threshold = CreateFrame("Slider", "DCTThresholdSlider", panel, "OptionsSliderTemplate")
+    threshold:SetPoint("TOPLEFT", prevGroup, "BOTTOMLEFT", -16, -28)
+    threshold:SetWidth(180)
+    threshold:SetMinMaxValues(0, 5)
+    threshold:SetValueStep(0.25)
+    if threshold.SetObeyStepOnDrag then threshold:SetObeyStepOnDrag(true) end
+    _G[threshold:GetName() .. "Low"]:SetText("0%")
+    _G[threshold:GetName() .. "High"]:SetText("5%")
+    threshold:SetScript("OnValueChanged", function(self, value)
+        ensureSettings()
+        value = math.floor(value * 4 + 0.5) / 4
+        DropChanceTooltipDB.minDropChancePercent = value
+        _G[self:GetName() .. "Text"]:SetText(string.format("Min drop chance: %.2f%%", value))
+    end)
+    panel.thresholdSlider = threshold
 
     local function refreshSettingsPanelState()
         ensureSettings()
@@ -1691,6 +2091,28 @@ local function createSettingsPanel()
         if panel.mobFilterCheck then
             panel.mobFilterCheck:SetChecked(DropChanceTooltipDB.enableMobRarityFilter == true)
         end
+
+        if panel.thresholdSlider then
+            local v = tonumber(DropChanceTooltipDB.minDropChancePercent) or 1.0
+            panel.thresholdSlider:SetValue(v)
+            _G[panel.thresholdSlider:GetName() .. "Text"]:SetText(string.format("Min drop chance: %.2f%%", v))
+        end
+        if panel.expandAllCheck then
+            panel.expandAllCheck:SetChecked(DropChanceTooltipDB.expandAllVarious == true)
+        end
+        if panel.questAlwaysCheck then
+            panel.questAlwaysCheck:SetChecked(DropChanceTooltipDB.alwaysShowQuestItems == true)
+        end
+        for _, key in ipairs(GROUP_ORDER) do
+            local mode = DropChanceTooltipDB.variousMode[key] or "collapse"
+            local showCheck = panel.groupShow[key]
+            local expandCheck = panel.groupExpand[key]
+            if showCheck then showCheck:SetChecked(mode ~= "hidden") end
+            if expandCheck then
+                expandCheck:SetChecked(mode == "expand")
+                expandCheck:SetEnabled(mode ~= "hidden")
+            end
+        end
     end
 
     panel.refresh = refreshSettingsPanelState
@@ -1704,16 +2126,33 @@ local function registerSettingsPanel()
     local panel = createSettingsPanel()
 
     if Settings and Settings.RegisterCanvasLayoutCategory and Settings.RegisterAddOnCategory then
-        local category = Settings.RegisterCanvasLayoutCategory(panel, "DropChanceTooltip")
-        category.ID = "DropChanceTooltip"
-        Settings.RegisterAddOnCategory(category)
-        settingsCategoryID = category.ID
+        -- Keep the category object and its REAL id (do NOT overwrite category.ID -- that desyncs it
+        -- from Settings' internal registry and breaks Settings.OpenToCategory).
+        settingsCategory = Settings.RegisterCanvasLayoutCategory(panel, "DropChanceTooltip")
+        Settings.RegisterAddOnCategory(settingsCategory)
+        settingsCategoryID = (settingsCategory.GetID and settingsCategory:GetID()) or settingsCategory.ID
         return
     end
 
     if type(InterfaceOptions_AddCategory) == "function" then
         InterfaceOptions_AddCategory(panel)
     end
+end
+
+-- Open the options panel reliably across client variants.
+local function openSettings()
+    createSettingsPanel()
+    if Settings and Settings.OpenToCategory and settingsCategoryID then
+        Settings.OpenToCategory(settingsCategoryID)
+        return
+    end
+    if InterfaceOptionsFrame_OpenToCategory then
+        local panel = createSettingsPanel()
+        InterfaceOptionsFrame_OpenToCategory(panel)
+        InterfaceOptionsFrame_OpenToCategory(panel) -- twice: Blizzard bug workaround
+        return
+    end
+    openSettingsWindow()
 end
 
 -- Keybinding labels (Key Bindings UI, under the "DropChanceTooltip" header).
@@ -1793,7 +2232,105 @@ local function runDiagnostics()
         end
         out(string.format("item %d: quality=%s sources=%s", id, tostring(q), tostring(n)))
     end
+    local npcCount = 0
+    for _ in pairs(mobDropIndex) do npcCount = npcCount + 1 end
+    out("mob reverse index: " .. npcCount .. " npcs (fills during preload; open-world tooltips only)")
+
     out("Now hover an item and run /dct debugchat first to see per-hover logs.")
+end
+
+-- Dump every indexed drop for an NPC (raw, no bucketing/filtering) with class/subclass ids, so we
+-- can confirm what's in the data (e.g. a quest item) and identify class ids (e.g. scrolls).
+local function runNpcDump(arg)
+    local function out(msg)
+        local line = "|cff66ccffDCT-NPC|r " .. tostring(msg)
+        if DEFAULT_CHAT_FRAME and DEFAULT_CHAT_FRAME.AddMessage then
+            DEFAULT_CHAT_FRAME:AddMessage(line)
+        else
+            print(line)
+        end
+    end
+
+    local npcID = tonumber(arg)
+    if not npcID then
+        local guid = (UnitGUID and (UnitGUID("mouseover") or UnitGUID("target")))
+        if guid then
+            local unitType, _, _, _, _, id = strsplit("-", guid)
+            if unitType == "Creature" or unitType == "Vehicle" then
+                npcID = tonumber(id)
+            end
+        end
+    end
+    if not npcID then
+        out("no npcID -- hover/target a mob, or /dct npc <id>")
+        return
+    end
+
+    local bucket = mobDropIndex[npcID]
+    if not bucket then
+        out(string.format("npc %d: no indexed drops (preload may be incomplete -- /dct diag)", npcID))
+        return
+    end
+
+    local list = {}
+    for itemID, chance in pairs(bucket) do
+        list[#list + 1] = { itemID = itemID, chance = chance }
+    end
+    table.sort(list, function(a, b) return a.chance > b.chance end)
+
+    out(string.format("npc %d: %d drops  (itemID | qN | class:sub | chance | name)", npcID, #list))
+    for _, e in ipairs(list) do
+        local name = GetItemInfo(e.itemID) or "?"
+        local q = LootDBLua and LootDBLua.GetItemQuality and LootDBLua.GetItemQuality(e.itemID)
+        local classID, subID = getItemClassInfo(e.itemID)
+        out(string.format("  %d | q%s | %s:%s | %s | %s",
+            e.itemID, tostring(q), tostring(classID), tostring(subID), formatChance(e.chance), tostring(name)))
+    end
+end
+
+-- /dct various [<group>|expandall [mode]]: manage the collapsible "various X" categories.
+local function handleVariousCommand(key, mode)
+    local function out(msg)
+        local line = "|cff66ccffDCT|r " .. tostring(msg)
+        if DEFAULT_CHAT_FRAME and DEFAULT_CHAT_FRAME.AddMessage then
+            DEFAULT_CHAT_FRAME:AddMessage(line)
+        else
+            print(line)
+        end
+    end
+    ensureSettings()
+
+    if not key or key == "" then
+        out("various groups (collapse | expand | hide):")
+        for _, g in ipairs(GROUP_ORDER) do
+            out(string.format("  %s = %s", g, tostring(DropChanceTooltipDB.variousMode[g])))
+        end
+        out("  expandAllVarious = " .. tostring(DropChanceTooltipDB.expandAllVarious))
+        out("usage: /dct various <group> collapse|expand|hide   |   /dct various expandall")
+        return
+    end
+
+    key = string.lower(key)
+    if key == "expandall" then
+        DropChanceTooltipDB.expandAllVarious = not DropChanceTooltipDB.expandAllVarious
+        out("expandAllVarious = " .. tostring(DropChanceTooltipDB.expandAllVarious))
+    elseif GROUP_META[key] then
+        mode = string.lower(mode or "")
+        if mode == "hide" then mode = "hidden" end
+        if mode == "collapse" or mode == "expand" or mode == "hidden" then
+            DropChanceTooltipDB.variousMode[key] = mode
+            out(string.format("various %s = %s", key, mode))
+        else
+            out(string.format("various %s is %s -- set with: collapse | expand | hide",
+                key, tostring(DropChanceTooltipDB.variousMode[key])))
+        end
+    else
+        out("unknown group '" .. key .. "'. Groups: " .. table.concat(GROUP_ORDER, ", ") .. ", expandall")
+        return
+    end
+
+    clearTooltipState(GameTooltip)
+    clearTooltipState(ItemRefTooltip)
 end
 
 local function installSlashCommands()
@@ -1801,6 +2338,21 @@ local function installSlashCommands()
     SLASH_DROPCHANCETOOLTIP2 = "/dc"
     SlashCmdList.DROPCHANCETOOLTIP = function(msg)
         local command = string.lower((msg or ""):match("^%s*(.-)%s*$") or "")
+
+        -- Word-split for subcommands that take arguments.
+        local args = {}
+        for w in string.gmatch(msg or "", "%S+") do args[#args + 1] = w end
+        local sub = string.lower(args[1] or "")
+
+        if sub == "npc" then
+            runNpcDump(args[2])
+            return
+        end
+
+        if sub == "various" then
+            handleVariousCommand(args[2], args[3])
+            return
+        end
 
         if command == "debugchat" then
             debugEnabled = not debugEnabled
@@ -1838,34 +2390,22 @@ local function installSlashCommands()
         end
 
         if command == "settings" then
-            if Settings and Settings.OpenToCategory then
-                local categoryID = settingsCategoryID or "DropChanceTooltip"
-                Settings.OpenToCategory(categoryID)
-            elseif InterfaceOptionsFrame_OpenToCategory then
-                local panel = createSettingsPanel()
-                InterfaceOptionsFrame_OpenToCategory(panel)
-                InterfaceOptionsFrame_OpenToCategory(panel)
-            else
-                openSettingsWindow()
-            end
+            openSettings()
             return
         end
 
         if command == "" then
-            if DEFAULT_CHAT_FRAME and DEFAULT_CHAT_FRAME.AddMessage then
-                DEFAULT_CHAT_FRAME:AddMessage("|cff66ccffDCT|r Usage: /dct toggle | on | off | settings | debugchat")
-            else
-                print("|cff66ccffDCT|r Usage: /dct toggle | on | off | settings | debugchat")
-            end
+            -- Bare /dct opens the options panel.
+            openSettings()
             return
         end
 
         if DEFAULT_CHAT_FRAME and DEFAULT_CHAT_FRAME.AddMessage then
             DEFAULT_CHAT_FRAME:AddMessage(string.format("|cff66ccffDCT|r Unknown command: %s", command))
-            DEFAULT_CHAT_FRAME:AddMessage("|cff66ccffDCT|r Usage: /dct toggle | on | off | settings | debugchat")
+            DEFAULT_CHAT_FRAME:AddMessage("|cff66ccffDCT|r Usage: /dct toggle|on|off | various | npc [id] | settings | debugchat | diag")
         else
             print(string.format("|cff66ccffDCT|r Unknown command: %s", command))
-            print("|cff66ccffDCT|r Usage: /dct toggle | on | off | settings | debugchat")
+            print("|cff66ccffDCT|r Usage: /dct toggle|on|off | various | npc [id] | settings | debugchat | diag")
         end
     end
 end
@@ -1878,8 +2418,14 @@ DropChanceTooltip:SetScript("OnEvent", function(_, event, arg1)
 
         ensureSettings()
         installTooltipHooks()
+        installMobDropIndex()
         installSlashCommands()
         registerSettingsPanel()
+        return
+    end
+
+    if event == "QUEST_LOG_UPDATE" then
+        questObjectivesDirty = true
         return
     end
 

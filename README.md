@@ -20,7 +20,17 @@ by astroVermilion), which must be installed alongside it.
 - **Rarity-scaled source list** — instead of dumping every source (e.g. ~860 for Linen Cloth),
   the item tooltip shows the **top N sources by drop %**, where N scales with the item's rarity
   (grey 3 → epic 15 → legendary+ 20; configurable in `sourceCountByRarity`). Shift expands.
-- `/dct diag` — one-shot diagnostics (LootDBLua load state, hook state, a sample data probe).
+- **Mob tooltips** (open-world only) — hover a mob → its notable drops:
+  - A **Quest Items** section (shown only for quests you're currently on; overridable), then
+  - **blue/epic** individually, then the **main common drops** (top N by %, with a configurable
+    **min‑% floor** so junk is hidden), then collapsible **"various X"** groups
+    (gems / patterns / schematics / enchants / recipes / scrolls / greens), each independently
+    **show / collapse / hide** in options. Shift reveals everything.
+  - Built on a source→items reverse index derived from LootDBLua at runtime (LootDBLua untouched).
+- **Options panel** — open with `/dct` (or Esc → Options → AddOns → DropChanceTooltip): rarity
+  filters, per-group show/collapse/hide, "expand all", "always show quest items", and the min‑%
+  slider.
+- `/dct diag`, `/dct npc [id]` — diagnostics (load/hook state; raw indexed drops for a mob).
 
 ## Requirements
 
@@ -28,8 +38,9 @@ by astroVermilion), which must be installed alongside it.
 
 ## Roadmap
 
-- Mob tooltips: hover a mob → its notable drops (open-world only; a Quest-items section first,
-  then regular drops ordered rare/epic → common).
+- **Quest-only drops:** LootDBLua (wowhead-derived) omits items that only drop while on-quest, so
+  they can't be shown yet. Planned: harvest Questie's quest/npc drop data into our own bundled
+  supplemental table (build-time; no runtime Questie dependency).
 - Material aggregation: for common mats, show mob-type + level ranges (needs per-mob level/type
   data; planned via QuestieDB cross-reference, later migrated into a bundled DB).
 

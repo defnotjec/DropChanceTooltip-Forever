@@ -1,0 +1,5 @@
+<Bindings>
+	<Binding name="DROPCHANCETOOLTIP_TOGGLE" header="DROPCHANCETOOLTIP" category="ADDONS">
+		DropChanceTooltip_Toggle()
+	</Binding>
+</Bindings>

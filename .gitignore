@@ -1,0 +1,4 @@
+# Local backup of the pristine upstream file (kept out of the repo)
+*.orig
+# macOS
+.DS_Store

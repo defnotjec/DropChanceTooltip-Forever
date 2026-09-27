@@ -243,6 +243,7 @@ dctRegisterEvent("PLAYER_CAMPING")           -- logout timer started
 dctRegisterEvent("PLAYER_QUITING")           -- quit timer started
 dctRegisterEvent("ZONE_CHANGED_NEW_AREA")    -- throttled reminder while roaming
 dctRegisterEvent("PLAYER_ENTERING_WORLD")    -- initial inventory snapshot
+dctRegisterEvent("PLAYER_LOGOUT")            -- reliable final snapshot before SavedVariables flush
 dctRegisterEvent("BAG_UPDATE_DELAYED")       -- bags changed -> re-snapshot carried
 dctRegisterEvent("BANKFRAME_OPENED")         -- bank readable -> snapshot bank
 dctRegisterEvent("BANKFRAME_CLOSED")
@@ -299,11 +300,23 @@ local defaultSettings = {
     -- Four independent toggles; Shift breaks the alt total down per character.
     showSelfBags = true,
     showSelfBank = true,
-    showAltsBags = false,
-    showAltsBank = false,
+    showAltsBags = true,
+    showAltsBank = true,
     -- Collapsed line shows just the grand total ("You have  54"); consolidated appends the split
     -- ("You have  54 (34 bags, 20 bank)"). Shift always expands to the full per-character breakdown.
     countConsolidated = false,
+    -- Only meaningful with countConsolidated: fold ALL characters into the collapsed total additively
+    -- (label becomes "Total"). Ignored/locked when countConsolidated is off.
+    countIncludeAlts = false,
+    -- Materials (cloth/leather/herb/ore) show an aggregated source summary instead of a per-NPC list.
+    enableMaterialAggregation = true,
+    -- A mob must drop a material at least this % of kills to count toward its level range/bands (below
+    -- = incidental side-drop, ignored). Tune live with /dct matmin. Leather has no drop data -> always counts.
+    materialMinPercent = 15,
+    -- Only generic trash defines a material's range: keep mobs whose level is a RANGE (minLevel<maxLevel);
+    -- drop named/unique mobs (a fixed single level) and elites/rares (rank>0). Best for limited items
+    -- like textiles. Toggle with /dct mattrash.
+    materialTrashOnly = true,
     showItemByRarity = {
         [0] = true, -- Poor
         [1] = true, -- Common
@@ -372,13 +385,27 @@ local function ensureSettings()
     if DropChanceTooltipDB.minQuestChancePercent == nil then
         DropChanceTooltipDB.minQuestChancePercent = defaultSettings.minQuestChancePercent
     end
-    for _, key in ipairs({ "showSelfBags", "showSelfBank", "showAltsBags", "showAltsBank", "countConsolidated" }) do
+    if DropChanceTooltipDB.enableMaterialAggregation == nil then
+        DropChanceTooltipDB.enableMaterialAggregation = defaultSettings.enableMaterialAggregation
+    end
+    if DropChanceTooltipDB.materialMinPercent == nil then
+        DropChanceTooltipDB.materialMinPercent = defaultSettings.materialMinPercent
+    end
+    if DropChanceTooltipDB.materialTrashOnly == nil then
+        DropChanceTooltipDB.materialTrashOnly = defaultSettings.materialTrashOnly
+    end
+    for _, key in ipairs({ "showSelfBags", "showSelfBank", "showAltsBags", "showAltsBank", "countConsolidated", "countIncludeAlts" }) do
         if DropChanceTooltipDB[key] == nil then
             DropChanceTooltipDB[key] = defaultSettings[key]
         end
     end
     if type(DropChanceTooltipDB.inventory) ~= "table" then
-        DropChanceTooltipDB.inventory = {}  -- [charKey] = {name,realm,class,faction,bags={},bank={},updated}
+        DropChanceTooltipDB.inventory = {}  -- [guid] = {name,realm,class,faction,bags={},bank={},updated}
+    end
+    -- The old name-realm keying collided same-first-name characters; wipe once and re-capture by GUID.
+    if DropChanceTooltipDB.inventoryKeyScheme ~= "guid" then
+        DropChanceTooltipDB.inventory = {}
+        DropChanceTooltipDB.inventoryKeyScheme = "guid"
     end
     -- Evidence log of Forever-specific gaps found through play: items/npcs we tried to show but
     -- had NO data for in any source. Exported via /dct gaps to seed the targeted Wowhead scrape.
@@ -1294,19 +1321,25 @@ end
 -- GetItemCount; other characters' counts come from bag/bank snapshots we record into account-wide
 -- SavedVariables as you play (and open the bank on) each one.
 -- ------------------------------------------------------------------------------------------------
+-- Key by GUID: UnitName returns only the FIRST name on this client, so same-first-name characters on
+-- one realm ("Jec" the Druid vs "Jec" the Shaman) collide and overwrite each other. GUID is unique.
 local function charKey()
-    local name = UnitName and UnitName("player")
+    local guid = UnitGUID and UnitGUID("player")
+    if guid then return guid end
+    local name = UnitName and UnitName("player")   -- fallback if GUID unavailable
     if not name then return nil end
-    local realm = (GetRealmName and GetRealmName()) or ""
-    return name .. "-" .. realm
+    return name .. "-" .. ((GetRealmName and GetRealmName()) or "")
 end
 
--- Sum stack counts across a list of container ids -> { [itemID] = count }.
+-- Sum stack counts across a list of container ids -> { [itemID] = count }, totalSlots. totalSlots==0
+-- means the containers aren't readable right now (bags not loaded / torn down at logout) -- callers
+-- MUST NOT overwrite a stored snapshot with an empty result in that case.
 local function scanContainers(bagList)
-    local counts = {}
-    if not GetContainerNumSlots then return counts end
+    local counts, totalSlots = {}, 0
+    if not GetContainerNumSlots then return counts, 0 end
     for _, bag in ipairs(bagList) do
         local slots = GetContainerNumSlots(bag) or 0
+        totalSlots = totalSlots + slots
         for slot = 1, slots do
             local id = GetContainerItemID and GetContainerItemID(bag, slot)
             local stack = 1
@@ -1318,7 +1351,7 @@ local function scanContainers(bagList)
             if id then counts[id] = (counts[id] or 0) + stack end
         end
     end
-    return counts
+    return counts, totalSlots
 end
 
 local CARRIED_BAGS = { 0 }  -- backpack + carried bags (0..NUM_BAG_SLOTS)
@@ -1346,7 +1379,14 @@ local function currentCharSnapshot()
         snap = {}
         inv[key] = snap
     end
-    snap.name = (UnitName and UnitName("player")) or snap.name
+    -- This client returns the LAST name in UnitName's 2nd value (normally the realm slot), so the full
+    -- character name is "First Last" (e.g. Jec Lock). Join them for the display name. (Must NOT wrap the
+    -- call in parens/`and` -- that truncates the 2nd return value.)
+    local first, last
+    if UnitName then first, last = UnitName("player") end
+    if first then
+        snap.name = (last and last ~= "") and (first .. " " .. last) or first
+    end
     snap.realm = (GetRealmName and GetRealmName()) or snap.realm
     snap.class = (UnitClass and select(2, UnitClass("player"))) or snap.class
     snap.faction = (UnitFactionGroup and UnitFactionGroup("player")) or snap.faction
@@ -1355,16 +1395,20 @@ local function currentCharSnapshot()
 end
 
 local function snapshotBags()
+    local counts, slots = scanContainers(CARRIED_BAGS)
+    if slots == 0 then return end   -- bags not readable (early login / logout teardown): don't wipe
     local snap = currentCharSnapshot()
-    if snap then snap.bags = scanContainers(CARRIED_BAGS) end
+    if snap then snap.bags = counts end
 end
 
 -- Only scan the bank while it is OPEN -- closed bank containers report 0 slots, which would wipe the
 -- stored snapshot to empty.
 local function snapshotBank()
     if not _bankIsOpen then return end
+    local counts, slots = scanContainers(bankContainers())
+    if slots == 0 then return end
     local snap = currentCharSnapshot()
-    if snap then snap.bank = scanContainers(bankContainers()) end
+    if snap then snap.bank = counts end
 end
 
 local function classColorHex(classFile)
@@ -1372,6 +1416,13 @@ local function classColorHex(classFile)
     if c and c.colorStr then return c.colorStr end
     if c then return string.format("ff%02x%02x%02x", (c.r or 1) * 255, (c.g or 1) * 255, (c.b or 1) * 255) end
     return "ffffffff"
+end
+
+-- Class-colored character label (full "First Last" name); the current character adds "(You)".
+local function charLabel(name, classFile, isYou)
+    local colored = string.format("|c%s%s|r", classColorHex(classFile), name or "?")
+    if isYou then colored = colored .. " |cff9d9d9d(You)|r" end
+    return colored
 end
 
 local function addOwnedCountsToTooltip(tooltip)
@@ -1384,10 +1435,10 @@ local function addOwnedCountsToTooltip(tooltip)
     if not itemID then return end
 
     local expanded = IsShiftKeyDown()
-    local sig = string.format("cnt:%d:%s:%s%s%s%s:%s", itemID, expanded and "1" or "0",
+    local sig = string.format("cnt:%d:%s:%s%s%s%s:%s%s", itemID, expanded and "1" or "0",
         db.showSelfBags and "1" or "0", db.showSelfBank and "1" or "0",
         db.showAltsBags and "1" or "0", db.showAltsBank and "1" or "0",
-        db.countConsolidated and "1" or "0")
+        db.countConsolidated and "1" or "0", db.countIncludeAlts and "1" or "0")
     if tooltip.__dctCountSig == sig then return end
     tooltip.__dctCountSig = sig
 
@@ -1415,58 +1466,273 @@ local function addOwnedCountsToTooltip(tooltip)
         altBagsSum, altBankSum = altBagsSum + a.bags, altBankSum + a.bank
     end
 
-    -- Portions honoring the four toggles. bags = "on person", bank = stored.
+    -- Included totals honoring the four toggles. bags = carried, bank = stored.
     local bagsPortion = (db.showSelfBags and selfBags or 0) + (db.showAltsBags and altBagsSum or 0)
     local bankPortion = (db.showSelfBank and selfBank or 0) + (db.showAltsBank and altBankSum or 0)
     local grand = bagsPortion + bankPortion
     if grand <= 0 then return end
 
-    local function nameColored(name, class)
-        return string.format("|c%s%s|r", classColorHex(class), name)
-    end
-
     tooltip:AddLine(" ")
 
     if not expanded then
-        -- Collapsed: a single grand-total line. "Consolidated" mode appends the bags/bank split.
-        local value = tostring(grand)
+        -- Hover: consolidated shows YOUR bags/bank as distinct "source of truth" figures; with
+        -- include-alts, alts fold in as ONE lumped number and the label becomes "Total":
+        --   "You have 12 (10 bags, 2 bank)"  ->  "Total 64 (10 bags, 2 bank, 52 alts)".
+        local withAlts = db.countConsolidated and db.countIncludeAlts
+        local sBags = db.showSelfBags and selfBags or 0
+        local sBank = db.showSelfBank and selfBank or 0
+        local altsLump = withAlts and ((db.showAltsBags and altBagsSum or 0) + (db.showAltsBank and altBankSum or 0)) or 0
+        local value = tostring(sBags + sBank + altsLump)
         if db.countConsolidated then
             local parts = {}
-            if bagsPortion > 0 then parts[#parts + 1] = bagsPortion .. " bags" end
-            if bankPortion > 0 then parts[#parts + 1] = bankPortion .. " bank" end
+            if sBags > 0 then parts[#parts + 1] = sBags .. " bags" end
+            if sBank > 0 then parts[#parts + 1] = sBank .. " bank" end
+            if altsLump > 0 then parts[#parts + 1] = altsLump .. " alts" end
             if #parts > 0 then value = value .. " (" .. table.concat(parts, ", ") .. ")" end
         end
-        tooltip:AddDoubleLine("You have", value, 1, 0.82, 0, 1, 1, 1)
+        tooltip:AddDoubleLine(withAlts and "Total" or "You have", value, 1, 0.82, 0, 1, 1, 1)
         return
     end
 
-    -- Expanded: everything on-person first (you, then each alt), a spacer, then the Bank section.
-    local wroteOnPerson = false
-    if db.showSelfBags and selfBags > 0 then
-        tooltip:AddDoubleLine("You have", tostring(selfBags), 1, 0.82, 0, 1, 1, 1)
-        wroteOnPerson = true
-    end
+    -- Shift: grand total up top, then a per-character bags breakdown, then a bank breakdown.
+    tooltip:AddDoubleLine("Total", tostring(grand), 1, 0.82, 0, 1, 1, 1)
+
+    local pfirst, plast
+    if UnitName then pfirst, plast = UnitName("player") end
+    local playerName = pfirst and ((plast and plast ~= "") and (pfirst .. " " .. plast) or pfirst) or "You"
+    local playerClass = UnitClass and select(2, UnitClass("player")) or nil
+    local youLabel = charLabel(playerName, playerClass, true)
+
+    local bagRows = {}
+    if db.showSelfBags and selfBags > 0 then bagRows[#bagRows + 1] = { label = youLabel, value = selfBags } end
     if db.showAltsBags then
         for _, a in ipairs(alts) do
-            if a.bags > 0 then
-                tooltip:AddDoubleLine("  " .. nameColored(a.name, a.class), tostring(a.bags), 1, 1, 1, 0.8, 0.8, 0.8)
-                wroteOnPerson = true
-            end
+            if a.bags > 0 then bagRows[#bagRows + 1] = { label = charLabel(a.name, a.class), value = a.bags } end
+        end
+    end
+    if #bagRows > 0 then
+        tooltip:AddLine("Bags", 1, 0.82, 0)
+        for _, r in ipairs(bagRows) do
+            tooltip:AddDoubleLine("  " .. r.label, tostring(r.value), 1, 1, 1, 1, 1, 1)
         end
     end
 
     local bankRows = {}
-    if db.showSelfBank and selfBank > 0 then bankRows[#bankRows + 1] = { label = "You", value = selfBank } end
+    if db.showSelfBank and selfBank > 0 then bankRows[#bankRows + 1] = { label = youLabel, value = selfBank } end
     if db.showAltsBank then
         for _, a in ipairs(alts) do
-            if a.bank > 0 then bankRows[#bankRows + 1] = { label = nameColored(a.name, a.class), value = a.bank } end
+            if a.bank > 0 then bankRows[#bankRows + 1] = { label = charLabel(a.name, a.class), value = a.bank } end
         end
     end
     if #bankRows > 0 then
-        if wroteOnPerson then tooltip:AddLine(" ") end
+        if #bagRows > 0 then tooltip:AddLine(" ") end
         tooltip:AddLine("Bank", 1, 0.82, 0)
         for _, r in ipairs(bankRows) do
-            tooltip:AddDoubleLine("  " .. r.label, tostring(r.value), 1, 1, 1, 0.8, 0.8, 0.8)
+            tooltip:AddDoubleLine("  " .. r.label, tostring(r.value), 1, 1, 1, 1, 1, 1)
+        end
+    end
+end
+
+-- ------------------------------------------------------------------------------------------------
+-- Material aggregation. For gathered/farmed materials, a per-NPC source list is noise ("linen drops
+-- from 200 humanoids"). Instead summarize: cloth -> "Humanoids 7-13", leather -> "Skinning . Beasts
+-- 21-36", herbs/ore -> "Herbalism 50" + top zones. All data is bundled (GatherNodes/MobLevels/
+-- SkinningSources); classic gathering/cloth sources are unchanged on Forever.
+-- ------------------------------------------------------------------------------------------------
+local CLOTH_ITEMS = {  -- humanoid trash cloth (Felcloth/Mooncloth/etc excluded -- not generic trash)
+    [2589] = true,  -- Linen Cloth
+    [2592] = true,  -- Wool Cloth
+    [4306] = true,  -- Silk Cloth
+    [4338] = true,  -- Mageweave Cloth
+    [14047] = true, -- Runecloth
+}
+
+-- ore ITEM name -> gathering NODE name(s) (item and node names differ: "Copper Ore" <- "Copper Vein").
+local ORE_ITEM_TO_NODES = {
+    ["Copper Ore"] = { "Copper Vein" },
+    ["Tin Ore"] = { "Tin Vein" },
+    ["Silver Ore"] = { "Silver Vein", "Ooze Covered Silver Vein" },
+    ["Gold Ore"] = { "Gold Vein", "Ooze Covered Gold Vein" },
+    ["Iron Ore"] = { "Iron Deposit", "Ooze Covered Iron Deposit" },
+    ["Mithril Ore"] = { "Mithril Deposit", "Ooze Covered Mithril Deposit" },
+    ["Truesilver Ore"] = { "Truesilver Deposit", "Ooze Covered Truesilver Deposit" },
+    ["Thorium Ore"] = { "Small Thorium Vein", "Rich Thorium Vein", "Ooze Covered Thorium Vein" },
+    ["Dark Iron Ore"] = { "Dark Iron Deposit" },
+}
+
+-- Required gathering skill per node (classic). Missing -> line shows the profession without a number.
+local HERB_SKILL = {
+    ["Peacebloom"]=1, ["Silverleaf"]=1, ["Earthroot"]=15, ["Mageroyal"]=50, ["Briarthorn"]=70,
+    ["Stranglekelp"]=85, ["Bruiseweed"]=100, ["Wild Steelbloom"]=115, ["Grave Moss"]=120,
+    ["Kingsblood"]=125, ["Liferoot"]=150, ["Fadeleaf"]=160, ["Goldthorn"]=170,
+    ["Khadgar's Whisker"]=185, ["Wintersbite"]=195, ["Firebloom"]=205, ["Purple Lotus"]=210,
+    ["Arthas' Tears"]=220, ["Sungrass"]=230, ["Blindweed"]=235, ["Ghost Mushroom"]=245,
+    ["Gromsblood"]=250, ["Golden Sansam"]=260, ["Dreamfoil"]=270, ["Mountain Silversage"]=280,
+    ["Plaguebloom"]=285, ["Icecap"]=290, ["Black Lotus"]=300,
+}
+local ORE_SKILL = {
+    ["Copper Vein"]=1, ["Tin Vein"]=65, ["Silver Vein"]=75, ["Gold Vein"]=115, ["Iron Deposit"]=125,
+    ["Mithril Deposit"]=175, ["Truesilver Deposit"]=230, ["Small Thorium Vein"]=245,
+    ["Rich Thorium Vein"]=275, ["Dark Iron Deposit"]=230,
+    ["Ooze Covered Silver Vein"]=75, ["Ooze Covered Gold Vein"]=115, ["Ooze Covered Iron Deposit"]=125,
+    ["Ooze Covered Mithril Deposit"]=175, ["Ooze Covered Truesilver Deposit"]=230,
+    ["Ooze Covered Thorium Vein"]=245,
+}
+
+-- Creature source entries {npcID, pct?} that drop an item, from LootDBLua (pct = drop chance %).
+local function creatureSourceEntries(itemID)
+    local sources = getSources(itemID)
+    local entries = {}
+    if sources then
+        for _, s in ipairs(sources) do
+            if s.sourceID and (s.sourceType == 0 or s.sourceType == nil) then
+                local pct = s.chancePercent or (s.chance and s.chance / 100) or nil
+                entries[#entries + 1] = { npcID = s.sourceID, pct = pct }
+            end
+        end
+    end
+    return entries
+end
+
+-- A normal mob's loot table can't give a specific tradeable material >= this % of kills; values at/above
+-- are small-sample noise (e.g. wowhead 3/3 = 100%) and are excluded from the range/bands.
+local MATERIAL_PCT_CEILING = 90
+local MATERIAL_BAND_TARGET = 5  -- aim for this many level bands on Shift-expand (cloth/leather)
+
+-- Pick a friendly band width that yields ~MATERIAL_BAND_TARGET bands across [lo,hi]. Bands are ANCHORED
+-- at lo (not 0) and the last band is capped at hi, so a 5-30 span reads 5-10/10-15/.../25-30.
+local function chooseBandWidth(lo, hi)
+    local span = math.max((hi or lo or 1) - (lo or 0), 1)
+    local best, bestScore
+    for _, w in ipairs({ 5, 10, 15, 20, 25, 50 }) do   -- ascending: smaller width wins ties (finer)
+        local n = math.ceil(span / w)                   -- bands anchored at lo covering [lo,hi]
+        local score = math.abs(n - MATERIAL_BAND_TARGET)
+        if not bestScore or score < bestScore then
+            best, bestScore = w, score
+        end
+    end
+    return best or 10
+end
+
+-- Reduce creature sources to an honest picture: NORMAL mobs only (rank 0 -- no rares/elites/bosses),
+-- with the low-% tail trimmed. Returns overall lo/hi level, adaptive bands -> {minpct,maxpct,count},
+-- and the band width used.
+local function analyzeCreatureSources(entries)
+    local lv = DropChanceTooltip_MobLevels
+    if not lv then return nil end
+
+    -- Only mobs that drop it at a MEANINGFUL rate define the range/bands. Incidental low-% droppers
+    -- (a mob whose Linen is a rare side-drop) and small-sample ~100% noise are both excluded, so the
+    -- range reflects where you'd actually farm it. Sources with no drop data (leather) always count.
+    local floor = (DropChanceTooltipDB and DropChanceTooltipDB.materialMinPercent) or defaultSettings.materialMinPercent
+    local trashOnly = not (DropChanceTooltipDB and DropChanceTooltipDB.materialTrashOnly == false)
+    local lo, hi, kept = nil, nil, {}
+    for _, e in ipairs(entries) do
+        local ml = lv[e.npcID]
+        -- generic trash = rank 0 AND a level RANGE (minLevel<maxLevel); named/unique mobs are fixed-level.
+        local isTrash = ml and (ml[3] or 0) == 0 and ((not trashOnly) or ((ml[1] or 0) > 0 and (ml[2] or 0) > ml[1]))
+        if isTrash then
+            local pct = e.pct
+            if (pct == nil) or (pct >= floor and pct < MATERIAL_PCT_CEILING) then
+                local mn, mx = ml[1] or 0, ml[2] or 0
+                kept[#kept + 1] = { lo = mn, hi = mx, lvl = (mx > 0 and mx) or mn, pct = pct }
+                if mn > 0 then lo = lo and math.min(lo, mn) or mn end
+                if mx > 0 then hi = hi and math.max(hi, mx) or mx end
+            end
+        end
+    end
+    if #kept == 0 then return nil end
+
+    local base = lo or 1
+    local width = chooseBandWidth(base, hi)
+    local maxIdx = math.max(math.ceil(((hi or base) - base) / width) - 1, 0)  -- fold the top mob in
+    local bands = {}
+    for _, r in ipairs(kept) do
+        local lvl = (r.lvl > 0 and r.lvl) or base
+        local idx = math.min(math.max(math.floor((lvl - base) / width), 0), maxIdx)  -- anchored at min
+        local bstart = base + idx * width
+        local b = bands[bstart] or { count = 0 }
+        b.count = b.count + 1
+        if r.pct then
+            b.minpct = b.minpct and math.min(b.minpct, r.pct) or r.pct
+            b.maxpct = b.maxpct and math.max(b.maxpct, r.pct) or r.pct
+        end
+        bands[bstart] = b
+    end
+    return lo, hi, bands, width
+end
+
+-- Returns an aggregation descriptor for a material item, or nil to fall through to the normal list.
+local function getMaterialAggregation(itemID)
+    if not (DropChanceTooltipDB and DropChanceTooltipDB.enableMaterialAggregation) then return nil end
+    local name = GetItemInfo and GetItemInfo(itemID)
+    local gn = DropChanceTooltip_GatherNodes
+
+    if name and gn and gn.herb and gn.herb[name] then
+        return { kind = "herb", prof = "Herbalism", skill = HERB_SKILL[name], zones = gn.herb[name] }
+    end
+    if name and gn and gn.ore and ORE_ITEM_TO_NODES[name] then
+        local zones, skill = {}, nil
+        for _, node in ipairs(ORE_ITEM_TO_NODES[name]) do
+            local z = gn.ore[node]
+            if z then for zone, c in pairs(z) do zones[zone] = (zones[zone] or 0) + c end end
+            local s = ORE_SKILL[node]
+            if s and (not skill or s < skill) then skill = s end
+        end
+        if next(zones) then return { kind = "ore", prof = "Mining", skill = skill, zones = zones } end
+    end
+    if CLOTH_ITEMS[itemID] then
+        return { kind = "cloth", label = "Humanoids", entries = creatureSourceEntries(itemID) }
+    end
+    local sk = DropChanceTooltip_SkinningSources
+    if sk and sk[itemID] then
+        local entries = {}
+        for _, npcID in ipairs(sk[itemID]) do entries[#entries + 1] = { npcID = npcID } end
+        return { kind = "leather", label = "Beasts", prof = "Skinning", entries = entries }
+    end
+    return nil
+end
+
+local function renderMaterialAggregation(tooltip, agg, expanded)
+    tooltip:AddLine(" ")
+    if agg.kind == "herb" or agg.kind == "ore" then
+        local right = agg.skill and (agg.prof .. " " .. agg.skill) or agg.prof
+        tooltip:AddDoubleLine("Gathered", right, 1, 0.82, 0, 1, 1, 1)
+        local zlist = {}
+        for zone, c in pairs(agg.zones) do zlist[#zlist + 1] = { zone, c } end
+        table.sort(zlist, function(a, b) return a[2] > b[2] end)
+        if expanded then
+            for _, z in ipairs(zlist) do
+                tooltip:AddDoubleLine("  " .. z[1], tostring(z[2]), 1, 1, 1, 0.8, 0.8, 0.8)
+            end
+        else
+            local top = {}
+            for i = 1, math.min(4, #zlist) do top[#top + 1] = zlist[i][1] end
+            local extra = (#zlist > 4) and ("  (+" .. (#zlist - 4) .. " «Shift»)") or ""
+            tooltip:AddLine("  " .. table.concat(top, ", ") .. extra, 0.8, 0.8, 0.8)
+        end
+        return
+    end
+
+    -- cloth / leather: normal-mob type + level range (rares/elites and the low-% tail excluded)
+    local lo, hi, bands, width = analyzeCreatureSources(agg.entries)
+    local rangeText = (lo and hi) and (agg.label .. " " .. lo .. "-" .. hi) or agg.label
+    tooltip:AddDoubleLine(agg.prof or "Source", rangeText, 1, 0.82, 0, 1, 1, 1)
+    if expanded and bands and next(bands) then
+        local starts = {}
+        for b in pairs(bands) do starts[#starts + 1] = b end
+        table.sort(starts)
+        for _, b in ipairs(starts) do
+            local band = bands[b]
+            local right
+            if band.minpct then
+                right = (band.minpct == band.maxpct) and string.format("%.0f%%", band.maxpct)
+                    or string.format("%.0f-%.0f%%", band.minpct, band.maxpct)
+            else
+                right = band.count .. (band.count == 1 and " mob" or " mobs")
+            end
+            local btop = math.min(b + width, hi or (b + width))   -- never overshoot the real max
+            tooltip:AddDoubleLine(string.format("  %d-%d", b, btop), right, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8)
         end
     end
 end
@@ -1495,6 +1761,14 @@ local function addDropDataToTooltip(tooltip)
     local signature = buildSignature(itemID, expanded, quality)
     if tooltip.__dctSignature == signature then
         debugPrint(string.format("addItem %d: signature match -> SKIP (dedupe)", itemID))
+        return
+    end
+
+    -- Materials (cloth/leather/herb/ore) show an aggregated summary instead of a per-NPC list.
+    local agg = getMaterialAggregation(itemID)
+    if agg then
+        tooltip.__dctSignature = signature
+        renderMaterialAggregation(tooltip, agg, expanded)
         return
     end
 
@@ -2322,7 +2596,16 @@ local function createSettingsPanel()
         { key = "showAltsBags", label = "Alts' bags" },
         { key = "showAltsBank", label = "Alts' bank" },
         { key = "countConsolidated", label = "Consolidated total (n bags, n bank)" },
+        { key = "countIncludeAlts", label = "Include alts in total", indent = true },
     }
+    -- "Include alts in total" only applies to the consolidated total, so it's disabled unless
+    -- Consolidated is checked.
+    local function syncIncludeAlts()
+        local ia = panel.countChecks.countIncludeAlts
+        if ia then ia:SetEnabled(DropChanceTooltipDB.countConsolidated == true) end
+    end
+    panel.syncIncludeAlts = syncIncludeAlts
+
     local prevCount
     for _, spec in ipairs(countSpec) do
         local check = CreateFrame("CheckButton", nil, panel, "InterfaceOptionsCheckButtonTemplate")
@@ -2331,15 +2614,17 @@ local function createSettingsPanel()
         if not prevCount then
             check:SetPoint("TOPLEFT", countSubtitle, "BOTTOMLEFT", 16, -6)
         else
-            check:SetPoint("TOPLEFT", prevCount, "BOTTOMLEFT", 0, -4)
+            check:SetPoint("TOPLEFT", prevCount, "BOTTOMLEFT", spec.indent and 12 or 0, -4)
         end
         check:SetScript("OnClick", function(self)
             ensureSettings()
             DropChanceTooltipDB[self.dbKey] = self:GetChecked() and true or false
+            if self.dbKey == "countConsolidated" then syncIncludeAlts() end
         end)
         panel.countChecks[spec.key] = check
         prevCount = check
     end
+    syncIncludeAlts()
 
     -- ---- Mob tooltip: "various X" groups + drop-chance floor (third column) ------------------
     local variousSubtitle = panel:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
@@ -2458,6 +2743,7 @@ local function createSettingsPanel()
             for key, check in pairs(panel.countChecks) do
                 check:SetChecked(DropChanceTooltipDB[key] == true)
             end
+            if panel.syncIncludeAlts then panel.syncIncludeAlts() end
         end
         for _, key in ipairs(GROUP_ORDER) do
             local mode = DropChanceTooltipDB.variousMode[key] or "collapse"
@@ -2868,17 +3154,191 @@ local function runCountCommand(arg)
         consolidate = "countConsolidated",
     }
     local a = arg and arg:lower() or ""
+    if a == "includealts" then
+        if not DropChanceTooltipDB.countConsolidated then
+            out("enable /dct count consolidate first -- include-alts only applies to the consolidated total")
+            return
+        end
+        DropChanceTooltipDB.countIncludeAlts = not DropChanceTooltipDB.countIncludeAlts
+        out("include alts in total = " .. tostring(DropChanceTooltipDB.countIncludeAlts))
+        return
+    end
     if map[a] then
         DropChanceTooltipDB[map[a]] = not DropChanceTooltipDB[map[a]]
         out(a .. " = " .. tostring(DropChanceTooltipDB[map[a]]))
         return
     end
-    out("item-count toggles (hover shows the grand total; Shift expands per character):")
-    out(string.format("  self bags: %s  ·  self bank: %s  ·  alts bags: %s  ·  alts bank: %s  ·  consolidated: %s",
+
+    local function whoName(snap)
+        local nm = (snap and snap.name) or (UnitName and UnitName("player")) or "?"
+        local cf = snap and snap.class
+        if cf then nm = nm .. " (" .. ((LOCALIZED_CLASS_NAMES_MALE and LOCALIZED_CLASS_NAMES_MALE[cf]) or cf) .. ")" end
+        return nm
+    end
+
+    if a == "bank" then
+        local counts, slots = scanContainers(bankContainers())
+        local n = 0
+        for _ in pairs(counts) do n = n + 1 end
+        out(string.format("bank scan RIGHT NOW: %d slots, %d distinct items (bankIsOpen=%s)", slots, n, tostring(_bankIsOpen)))
+        if slots == 0 then
+            out("0 slots -> the bank isn't readable. Open your bank and re-run; if still 0, the bank container ids are wrong for this client.")
+        else
+            out("scan works -> your bank IS captured on open. If an alt's bank is missing, open that alt's bank once then log out cleanly.")
+        end
+        return
+    end
+
+    if a == "clear" then
+        DropChanceTooltipDB.inventory = {}
+        snapshotBags()
+        snapshotBank()
+        out("cleared recorded characters; re-saved the current one. Log each alt + /dct count save.")
+        return
+    end
+
+    if a == "save" then
+        snapshotBags()
+        snapshotBank()  -- no-op unless the bank is open
+        local snap = DropChanceTooltipDB.inventory[charKey() or ""]
+        local nb, nk = 0, 0
+        if snap then
+            for _ in pairs(snap.bags or {}) do nb = nb + 1 end
+            for _ in pairs(snap.bank or {}) do nk = nk + 1 end
+        end
+        out(string.format("saved %s: %d bag items, %d bank items%s",
+            whoName(snap), nb, nk, snap and "" or " (FAILED -- no GUID/name?)"))
+        return
+    end
+
+    if a == "list" then
+        local names = {}
+        for _, snap in pairs(DropChanceTooltipDB.inventory or {}) do
+            local nb, nk = 0, 0
+            for _ in pairs(snap.bags or {}) do nb = nb + 1 end
+            for _ in pairs(snap.bank or {}) do nk = nk + 1 end
+            names[#names + 1] = string.format("  %s: %d bag / %d bank items", whoName(snap), nb, nk)
+        end
+        table.sort(names)
+        out((#names) .. " character(s) recorded:")
+        for _, l in ipairs(names) do out(l) end
+        out("you are " .. whoName(DropChanceTooltipDB.inventory[charKey() or ""]) .. " (/dct count save to record now)")
+        return
+    end
+
+    out("item-count toggles (hover shows your total; Shift expands per character):")
+    out(string.format("  self bags: %s  ·  self bank: %s  ·  alts bags: %s  ·  alts bank: %s",
         tostring(DropChanceTooltipDB.showSelfBags), tostring(DropChanceTooltipDB.showSelfBank),
-        tostring(DropChanceTooltipDB.showAltsBags), tostring(DropChanceTooltipDB.showAltsBank),
-        tostring(DropChanceTooltipDB.countConsolidated)))
-    out("toggle with: /dct count selfbags | selfbank | altsbags | altsbank | consolidate")
+        tostring(DropChanceTooltipDB.showAltsBags), tostring(DropChanceTooltipDB.showAltsBank)))
+    out(string.format("  consolidated: %s  ·  include alts in total: %s",
+        tostring(DropChanceTooltipDB.countConsolidated), tostring(DropChanceTooltipDB.countIncludeAlts)))
+    out("toggle: /dct count selfbags | selfbank | altsbags | altsbank | consolidate | includealts")
+    out("also: /dct count list | save | bank (diagnose)")
+end
+
+-- /dct whoami: probe every name API to find which one surfaces the full "First Last" name on this
+-- client (UnitName returns first only). Whichever shows the full name, we wire into the snapshot.
+local function runWhoAmI()
+    local function out(msg)
+        local line = "|cff66ccffDCT-WHO|r " .. tostring(msg)
+        if DEFAULT_CHAT_FRAME and DEFAULT_CHAT_FRAME.AddMessage then DEFAULT_CHAT_FRAME:AddMessage(line) else print(line) end
+    end
+    local function try(label, fn)
+        local ok, a, b = pcall(fn)
+        if not ok then a = "err" end
+        out(string.format("%-24s = %s%s", label, tostring(a), (b ~= nil) and (" | realm=" .. tostring(b)) or ""))
+    end
+    try("UnitName", function() return UnitName("player") end)
+    try("GetUnitName(true)", function() return GetUnitName("player", true) end)
+    try("UnitFullName", function() return UnitFullName("player") end)
+    try("UnitPVPName", function() return UnitPVPName("player") end)
+    try("UnitNameUnmodified", function() return UnitNameUnmodified("player") end)
+    try("GetPlayerInfoByGUID.name", function() return (select(6, GetPlayerInfoByGUID(UnitGUID("player")))) end)
+    -- tooltip scrape: on RP clients the unit tooltip's first line shows the full displayed name.
+    local ok, txt = pcall(function()
+        local tt = _G.DCTScanTip or CreateFrame("GameTooltip", "DCTScanTip", nil, "GameTooltipTemplate")
+        tt:SetOwner(UIParent, "ANCHOR_NONE")
+        tt:ClearLines()
+        tt:SetUnit("player")
+        local left = _G["DCTScanTipTextLeft1"]
+        return left and left:GetText()
+    end)
+    out(string.format("%-24s = %s", "tooltip line1", ok and tostring(txt) or "err"))
+    out("-> tell me which line shows your FULL name and I'll store that.")
+end
+
+-- /dct matdump [itemID]: break down what feeds a material's aggregation (per-source %/level, and why
+-- each is kept or excluded), so the level range and band low/high ends can be understood and tuned.
+local function runMatDump(arg)
+    local function out(msg)
+        local line = "|cff66ccffDCT-MAT|r " .. tostring(msg)
+        if DEFAULT_CHAT_FRAME and DEFAULT_CHAT_FRAME.AddMessage then DEFAULT_CHAT_FRAME:AddMessage(line) else print(line) end
+    end
+    ensureSettings()
+    local itemID = tonumber(arg)
+    if not itemID then
+        itemID = (GameTooltip and getItemIDFromTooltip(GameTooltip)) or (ItemRefTooltip and getItemIDFromTooltip(ItemRefTooltip))
+    end
+    if not itemID then out("usage: /dct matdump <itemID>  (or hover an item first)"); return end
+    local name = (GetItemInfo and GetItemInfo(itemID)) or ("item " .. itemID)
+    local gn = DropChanceTooltip_GatherNodes
+
+    -- herb / ore: dump zones by node density
+    local function dumpZones(kind, nodes)
+        local zones = {}
+        for _, node in ipairs(nodes) do
+            local z = gn and gn[kind] and gn[kind][node]
+            if z then for zone, c in pairs(z) do zones[zone] = (zones[zone] or 0) + c end end
+        end
+        local zl = {}
+        for zone, c in pairs(zones) do zl[#zl + 1] = { zone, c } end
+        table.sort(zl, function(a, b) return a[2] > b[2] end)
+        out(name .. " = " .. kind .. " (" .. table.concat(nodes, ", ") .. ")")
+        for _, z in ipairs(zl) do out(string.format("  %-24s %d nodes", z[1], z[2])) end
+    end
+    if name and gn and gn.herb and gn.herb[name] then return dumpZones("herb", { name }) end
+    if name and ORE_ITEM_TO_NODES[name] and gn and gn.ore then return dumpZones("ore", ORE_ITEM_TO_NODES[name]) end
+
+    -- cloth / leather: dump creature sources
+    local entries, label
+    if CLOTH_ITEMS[itemID] then
+        entries, label = creatureSourceEntries(itemID), "cloth (Humanoids)"
+    elseif DropChanceTooltip_SkinningSources and DropChanceTooltip_SkinningSources[itemID] then
+        entries = {}
+        for _, n in ipairs(DropChanceTooltip_SkinningSources[itemID]) do entries[#entries + 1] = { npcID = n } end
+        label = "leather (Beasts)"
+    else
+        out(name .. " is not a recognized material (no aggregation)"); return
+    end
+
+    local lv = DropChanceTooltip_MobLevels
+    local floor = DropChanceTooltipDB.materialMinPercent or defaultSettings.materialMinPercent
+    local trashOnly = DropChanceTooltipDB.materialTrashOnly ~= false
+    local rows = {}
+    for _, e in ipairs(entries) do
+        local ml = lv and lv[e.npcID]
+        rows[#rows + 1] = { id = e.npcID, pct = e.pct, mn = ml and ml[1] or 0, mx = ml and ml[2] or 0, rk = ml and (ml[3] or 0) or nil, lvl = ml ~= nil }
+    end
+    table.sort(rows, function(a, b) return (a.pct or 0) > (b.pct or 0) end)
+    out(string.format("%s = %s: %d sources | min %.0f%% (/dct matmin) | ceiling %d%% | trash-only %s (/dct mattrash)",
+        name, label, #rows, floor, MATERIAL_PCT_CEILING, trashOnly and "ON" or "off"))
+    out("  %drop  level    npc  [excluded: reason]")
+    local shown = 0
+    for _, r in ipairs(rows) do
+        shown = shown + 1
+        if shown <= 40 then
+            local why = {}
+            if not r.lvl then why[#why + 1] = "no-level" end
+            if r.rk and r.rk ~= 0 then why[#why + 1] = "rank" .. r.rk end
+            if trashOnly and r.lvl and (r.rk == 0) and not (r.mn > 0 and r.mx > r.mn) then why[#why + 1] = "named" end
+            if r.pct and r.pct >= MATERIAL_PCT_CEILING then why[#why + 1] = "noise%" end
+            if r.pct and r.pct < floor then why[#why + 1] = "below-min" end
+            local nm = getCachedSourceName(0, r.id) or ("npc " .. r.id)
+            out(string.format("  %5s  L%d-%d  %s  %s",
+                r.pct and string.format("%.1f%%", r.pct) or "  -  ", r.mn, r.mx, nm, table.concat(why, " ")))
+        end
+    end
+    if #rows > 40 then out("  ... " .. (#rows - 40) .. " more") end
 end
 
 local function installSlashCommands()
@@ -2904,6 +3364,47 @@ local function installSlashCommands()
 
         if sub == "count" then
             runCountCommand(args[2])
+            return
+        end
+
+        if sub == "matdump" then
+            runMatDump(args[2])
+            return
+        end
+
+        if sub == "whoami" then
+            runWhoAmI()
+            return
+        end
+
+        if sub == "mattrash" then
+            ensureSettings()
+            DropChanceTooltipDB.materialTrashOnly = not DropChanceTooltipDB.materialTrashOnly
+            if GameTooltip then GameTooltip.__dctSignature = nil end
+            local msg = string.format("|cff66ccffDCT|r material trash-only = %s (exclude named/unique + elite/rare mobs from the range)",
+                tostring(DropChanceTooltipDB.materialTrashOnly))
+            if DEFAULT_CHAT_FRAME and DEFAULT_CHAT_FRAME.AddMessage then DEFAULT_CHAT_FRAME:AddMessage(msg) else print(msg) end
+            return
+        end
+
+        if sub == "matmin" then
+            ensureSettings()
+            local n = tonumber(args[2])
+            if n then
+                DropChanceTooltipDB.materialMinPercent = math.max(0, math.min(n, 100))
+                if GameTooltip then GameTooltip.__dctSignature = nil end
+            end
+            local msg = string.format("|cff66ccffDCT|r material min drop = %.0f%% (a mob must drop it this often to set the range/bands)", DropChanceTooltipDB.materialMinPercent)
+            if DEFAULT_CHAT_FRAME and DEFAULT_CHAT_FRAME.AddMessage then DEFAULT_CHAT_FRAME:AddMessage(msg) else print(msg) end
+            return
+        end
+
+        if sub == "materials" or sub == "mats" then
+            ensureSettings()
+            DropChanceTooltipDB.enableMaterialAggregation = not DropChanceTooltipDB.enableMaterialAggregation
+            local msg = "|cff66ccffDCT|r material aggregation = " .. tostring(DropChanceTooltipDB.enableMaterialAggregation)
+            if DEFAULT_CHAT_FRAME and DEFAULT_CHAT_FRAME.AddMessage then DEFAULT_CHAT_FRAME:AddMessage(msg) else print(msg) end
+            if GameTooltip then GameTooltip.__dctSignature = nil end
             return
         end
 
@@ -2960,10 +3461,10 @@ local function installSlashCommands()
 
         if DEFAULT_CHAT_FRAME and DEFAULT_CHAT_FRAME.AddMessage then
             DEFAULT_CHAT_FRAME:AddMessage(string.format("|cff66ccffDCT|r Unknown command: %s", command))
-            DEFAULT_CHAT_FRAME:AddMessage("|cff66ccffDCT|r Usage: /dct toggle|on|off | various | count | npc [id] | gaps [export|clear|test] | settings | debugchat | diag")
+            DEFAULT_CHAT_FRAME:AddMessage("|cff66ccffDCT|r Usage: /dct toggle|on|off | various | count | materials | matmin [%] | mattrash | matdump [id] | npc [id] | gaps [export|clear|test] | settings | debugchat | diag")
         else
             print(string.format("|cff66ccffDCT|r Unknown command: %s", command))
-            print("|cff66ccffDCT|r Usage: /dct toggle|on|off | various | count | npc [id] | gaps [export|clear|test] | settings | debugchat | diag")
+            print("|cff66ccffDCT|r Usage: /dct toggle|on|off | various | count | materials | matmin [%] | mattrash | matdump [id] | npc [id] | gaps [export|clear|test] | settings | debugchat | diag")
         end
     end
 end
@@ -2997,14 +3498,25 @@ DropChanceTooltip:SetScript("OnEvent", function(_, event, arg1)
         return
     end
 
-    if event == "PLAYER_ENTERING_WORLD" or event == "BAG_UPDATE_DELAYED" then
-        snapshotBags()
+    if event == "PLAYER_ENTERING_WORLD" then
+        -- Bags aren't loaded yet at ENTERING_WORLD; snapshot a few seconds later once they are.
+        if C_Timer and C_Timer.After then
+            C_Timer.After(3, snapshotBags)
+        else
+            snapshotBags()
+        end
+        return
+    end
+
+    if event == "BAG_UPDATE_DELAYED" or event == "PLAYER_LOGOUT" then
+        snapshotBags()   -- bags are loaded here; PLAYER_LOGOUT fires right before the SavedVariables flush
         return
     end
 
     if event == "BANKFRAME_OPENED" then
         _bankIsOpen = true
         snapshotBank()
+        if C_Timer and C_Timer.After then C_Timer.After(1, snapshotBank) end  -- slots can populate late
         return
     end
 

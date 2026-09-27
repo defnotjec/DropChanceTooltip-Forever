@@ -10,6 +10,14 @@
 # global is available when the main file merges it into the mob-drop index.
 Data\QuestieDrops.lua
 
+# Material-aggregation data (all bundled/harvested; classic data, unchanged on Forever):
+#   GatherNodes  = herb/ore -> zones      (tools/harvest_gathermate.py)
+#   MobLevels    = npc -> level range     (tools/harvest_mob_levels.py)
+#   SkinningSources = leather -> beasts   (tools/wowhead_scrape.py --skinning; optional until generated)
+Data\GatherNodes.lua
+Data\MobLevels.lua
+Data\SkinningSources.lua
+
 # Bindings.xml is auto-loaded from the addon folder by this client; do NOT list it here
 # (listing it double-loads and throws "Unrecognized XML: Binding" on login).
 DropChanceTooltip.lua

@@ -126,6 +126,30 @@ local function refreshActiveQuestObjectives()
     end
 end
 
+-- Record a Forever-specific gap (item/npc we could show nothing for) for later targeted scraping.
+-- Stores an enriched record (name/zone/level/count/dates) rather than a bare flag so a clean logout
+-- preserves a self-contained, human-readable evidence log in SavedVariables -- no need to export
+-- before quitting. (WoW writes SavedVariables to disk on clean logout/reload; there is no API to
+-- force a mid-session flush, so the copyable /dct gaps export string is the crash-proof channel.)
+local function recordGap(kind, id, name, meta)
+    if not id then return end
+    local gaps = DropChanceTooltipDB and DropChanceTooltipDB.gaps
+    if not (gaps and gaps[kind]) then return end
+    local rec = gaps[kind][id]
+    if type(rec) ~= "table" then rec = {} end   -- upgrade legacy `true` entries in place
+    gaps[kind][id] = rec
+    rec.count = (rec.count or 0) + 1
+    if name and name ~= "" and name ~= "?" then rec.name = name end
+    if meta then
+        if meta.zone and meta.zone ~= "" then rec.zone = meta.zone end
+        if meta.level and meta.level > 0 then rec.level = meta.level end
+    end
+    local stamp = date and date("%Y-%m-%d") or nil
+    rec.first = rec.first or stamp
+    rec.last = stamp or rec.last
+    DropChanceTooltipDB.gapsDirty = true       -- un-exported since last /dct gaps export
+end
+
 -- True if a quest-item drop matches an objective of a quest the player is currently on. Objective
 -- text looks like "Darksoul Shackle: 0/5", so we test whether it contains the item's name.
 local function isQuestDropRelevant(drop)
@@ -203,6 +227,9 @@ local DropChanceTooltip = CreateFrame("Frame")
 DropChanceTooltip:RegisterEvent("ADDON_LOADED")
 DropChanceTooltip:RegisterEvent("MODIFIER_STATE_CHANGED")
 DropChanceTooltip:RegisterEvent("QUEST_LOG_UPDATE")
+DropChanceTooltip:RegisterEvent("PLAYER_CAMPING")           -- logout timer started
+DropChanceTooltip:RegisterEvent("PLAYER_QUITING")           -- quit timer started
+DropChanceTooltip:RegisterEvent("ZONE_CHANGED_NEW_AREA")    -- throttled reminder while roaming
 
 local debugEnabled = false
 local modernHooksInstalled = false
@@ -311,6 +338,13 @@ local function ensureSettings()
     if DropChanceTooltipDB.alwaysShowQuestItems == nil then
         DropChanceTooltipDB.alwaysShowQuestItems = defaultSettings.alwaysShowQuestItems
     end
+    -- Evidence log of Forever-specific gaps found through play: items/npcs we tried to show but
+    -- had NO data for in any source. Exported via /dct gaps to seed the targeted Wowhead scrape.
+    if type(DropChanceTooltipDB.gaps) ~= "table" then
+        DropChanceTooltipDB.gaps = { items = {}, npcs = {} }
+    end
+    DropChanceTooltipDB.gaps.items = DropChanceTooltipDB.gaps.items or {}
+    DropChanceTooltipDB.gaps.npcs = DropChanceTooltipDB.gaps.npcs or {}
 
     if type(DropChanceTooltipDB.showItemByRarity) ~= "table" then
         DropChanceTooltipDB.showItemByRarity = {}
@@ -1244,6 +1278,16 @@ local function addDropDataToTooltip(tooltip)
     if not sources or #sources == 0 then
         debugPrint(string.format("addItem %d: no sources", itemID))
         tooltip.__dctSignature = signature
+        -- Record as a Forever-specific gap only if NO source has it (LootDBLua, Questie, or Wowhead).
+        if (not LootDBLua) or LootDBLua.IsLoaded == nil or LootDBLua.IsLoaded() then
+            local known = (DropChanceTooltip_QuestieDrops and DropChanceTooltip_QuestieDrops[itemID])
+                or (DropChanceTooltip_WowheadDrops and DropChanceTooltip_WowheadDrops[itemID])
+            if not known then
+                local nm = (GetItemInfo and GetItemInfo(itemID))
+                    or (DropChanceTooltip_QuestieItemNames and DropChanceTooltip_QuestieItemNames[itemID])
+                recordGap("items", itemID, nm)
+            end
+        end
         return
     end
 
@@ -1370,6 +1414,15 @@ local function addMobDropDataToTooltip(tooltip)
         local ready = stats and (stats.pendingChunkCount or 0) == 0 and (stats.queuedChunkCount or 0) == 0
         if ready then
             tooltip.__dctMobSignature = signature
+            -- open-world mob with no data anywhere: Forever-specific candidate. Grab name/zone/level
+            -- from the mouseover unit so the persisted record is human-readable later.
+            local mobName = (UnitExists and UnitExists("mouseover") and UnitName("mouseover")) or nil
+            local lvl = (UnitExists and UnitExists("mouseover") and UnitLevel and UnitLevel("mouseover")) or nil
+            local meta = {
+                zone = (GetRealZoneText and GetRealZoneText()) or (GetZoneText and GetZoneText()),
+                level = lvl,
+            }
+            recordGap("npcs", npcID, mobName, meta)
         end
         return
     end
@@ -2368,6 +2421,169 @@ local function handleVariousCommand(key, mode)
     clearTooltipState(ItemRefTooltip)
 end
 
+-- Build a readable, machine-parseable string of all collected gaps. Lines beginning `npc:`/`item:`
+-- carry the id first so a GitHub Action (or tools/) can extract them; the rest is human context.
+local function buildGapsExportString()
+    ensureSettings()
+    local gaps = DropChanceTooltipDB.gaps
+    local ver, bld = GetBuildInfo()
+    local npcIDs, itemIDs = {}, {}
+    for id in pairs(gaps.npcs) do npcIDs[#npcIDs + 1] = id end
+    for id in pairs(gaps.items) do itemIDs[#itemIDs + 1] = id end
+    table.sort(npcIDs)
+    table.sort(itemIDs)
+
+    local function fmt(id, rec)
+        local r = (type(rec) == "table") and rec or nil
+        local extra = {}
+        if r then
+            if r.name then extra[#extra + 1] = r.name end
+            if r.zone then extra[#extra + 1] = "[" .. r.zone .. "]" end
+            if r.level then extra[#extra + 1] = "lvl" .. r.level end
+            if r.count then extra[#extra + 1] = "x" .. r.count end
+            if r.last then extra[#extra + 1] = "(" .. r.last .. ")" end
+        end
+        return (#extra > 0) and (id .. "  " .. table.concat(extra, "  ")) or tostring(id)
+    end
+
+    local lines = {}
+    lines[#lines + 1] = string.format("DropChanceTooltip gaps | client %s build %s | %d npcs, %d items",
+        tostring(ver), tostring(bld), #npcIDs, #itemIDs)
+    lines[#lines + 1] = "# Forever-specific candidates: hovered in-world with NO drop data in any source."
+    lines[#lines + 1] = "## NPCs"
+    for _, id in ipairs(npcIDs) do lines[#lines + 1] = "npc:" .. fmt(id, gaps.npcs[id]) end
+    lines[#lines + 1] = "## Items"
+    for _, id in ipairs(itemIDs) do lines[#lines + 1] = "item:" .. fmt(id, gaps.items[id]) end
+    return table.concat(lines, "\n"), #npcIDs, #itemIDs
+end
+
+-- Copyable export dialog (mirrors ForeverVO's proven InputScrollFrame pattern for this client):
+-- the string goes out via a GitHub issue -- the only crash-proof channel, since it leaves the game.
+local gapsExportFrame
+local function showGapsExport()
+    local text, nn, ni = buildGapsExportString()
+    if (nn + ni) == 0 then
+        local msg = "|cff66ccffDCT-GAPS|r no gaps collected yet -- hover open-world mobs/items with no drop data first."
+        if DEFAULT_CHAT_FRAME and DEFAULT_CHAT_FRAME.AddMessage then DEFAULT_CHAT_FRAME:AddMessage(msg) else print(msg) end
+        return
+    end
+    if not gapsExportFrame then
+        local frame = CreateFrame("Frame", "DropChanceTooltipGapsExport", UIParent, "ButtonFrameTemplate")
+        gapsExportFrame = frame
+        frame:SetSize(560, 380)
+        frame:SetPoint("CENTER")
+        frame:SetFrameStrata("DIALOG")
+        frame:SetMovable(true)
+        frame:EnableMouse(true)
+        frame:RegisterForDrag("LeftButton")
+        frame:SetScript("OnDragStart", frame.StartMoving)
+        frame:SetScript("OnDragStop", frame.StopMovingOrSizing)
+        if frame.SetTitle then frame:SetTitle("DropChanceTooltip: contribute gaps") end
+        if ButtonFrameTemplate_HidePortrait then ButtonFrameTemplate_HidePortrait(frame) end
+        tinsert(UISpecialFrames, "DropChanceTooltipGapsExport") -- Escape closes
+
+        local hint = frame:CreateFontString(nil, "ARTWORK")
+        hint:SetFontObject("GameFontHighlight")
+        hint:SetJustifyH("LEFT")
+        hint:SetPoint("TOPLEFT", 16, -32)
+        hint:SetPoint("RIGHT", -16, 0)
+        hint:SetText("Press Ctrl+C to copy, then open a new issue at\n|cff6ec6ffgithub.com/defnotjec/DropChanceTooltip-Forever/issues/new?template=gaps.yml|r\nand paste. These are mobs/items with no drop data yet.")
+
+        local scroll = CreateFrame("ScrollFrame", nil, frame, "InputScrollFrameTemplate")
+        scroll:SetPoint("TOPLEFT", hint, "BOTTOMLEFT", 0, -12)
+        scroll:SetPoint("BOTTOMRIGHT", -30, 16)
+        scroll.EditBox:SetMaxLetters(0)
+        scroll.EditBox:SetFontObject("GameFontHighlightSmall")
+        scroll.EditBox:SetScript("OnEscapePressed", function() frame:Hide() end)
+        scroll.EditBox:SetScript("OnTextChanged", function(editBox, userInput)
+            if userInput then
+                editBox:SetText(frame.exportString or "")
+                editBox:HighlightText()
+            end
+        end)
+        if scroll.CharCount then scroll.CharCount:Hide() end
+        frame.scrollEdit = scroll.EditBox
+    end
+    gapsExportFrame.exportString = text
+    gapsExportFrame.scrollEdit:SetText(text)
+    gapsExportFrame:Show()
+    gapsExportFrame.scrollEdit:SetFocus()
+    gapsExportFrame.scrollEdit:HighlightText()
+    DropChanceTooltipDB.gapsDirty = false      -- assume the open block will be pasted
+end
+
+-- Remind the player to export before a clean logout/quit (or, throttled, on zone change), since an
+-- unclean exit is the only case that loses the in-memory gaps the client hasn't flushed yet.
+local lastGapNudge = 0
+local function nudgeGapsExport(reason)
+    if not (DropChanceTooltipDB and DropChanceTooltipDB.gaps and DropChanceTooltipDB.gapsDirty) then return end
+    local n = 0
+    for _ in pairs(DropChanceTooltipDB.gaps.npcs) do n = n + 1 end
+    for _ in pairs(DropChanceTooltipDB.gaps.items) do n = n + 1 end
+    if n == 0 then return end
+    local now = (time and time()) or 0
+    if reason == "zone" and (now - lastGapNudge) < 600 then return end   -- throttle zone nudges to 10 min
+    lastGapNudge = now
+    local msg = string.format("|cff66ccffDCT|r %d un-exported drop-data gap(s). |cffffd100/dct gaps export|r to copy them for contribution.", n)
+    if DEFAULT_CHAT_FRAME and DEFAULT_CHAT_FRAME.AddMessage then DEFAULT_CHAT_FRAME:AddMessage(msg) else print(msg) end
+end
+
+-- /dct gaps [clear|export]: show, reset, or copy the item/npc ids we found NO drop data for -- the
+-- evidence list for a targeted Wowhead-Forever scrape (paste items into tools/scrape_ids.txt).
+local function runGapsCommand(arg)
+    local function out(msg)
+        local line = "|cff66ccffDCT-GAPS|r " .. tostring(msg)
+        if DEFAULT_CHAT_FRAME and DEFAULT_CHAT_FRAME.AddMessage then
+            DEFAULT_CHAT_FRAME:AddMessage(line)
+        else
+            print(line)
+        end
+    end
+    ensureSettings()
+    local gaps = DropChanceTooltipDB.gaps
+
+    local a = arg and arg:lower() or ""
+
+    if a == "clear" then
+        gaps.items, gaps.npcs = {}, {}
+        DropChanceTooltipDB.gapsDirty = false
+        out("cleared.")
+        return
+    end
+
+    if a == "export" then
+        showGapsExport()
+        return
+    end
+
+    if a == "test" then
+        -- Inject a synthetic gap so the whole flow (record -> persist -> list -> export) is verifiable
+        -- without hunting for a data-less mob. Sentinel ids 999901/999902 -- remove with /dct gaps clear.
+        recordGap("npcs", 999901, "Test Dummy (DCT)", { zone = "Nowhere", level = 60 })
+        recordGap("items", 999902, "Test Trinket (DCT)")
+        out("injected a test npc (999901) + item (999902). Run |cffffd100/dct gaps|r to list, ")
+        out("|cffffd100/dct gaps export|r to see the copyable block, then |cffffd100/dct gaps clear|r.")
+        return
+    end
+
+    local items, npcs = {}, {}
+    for id in pairs(gaps.items) do items[#items + 1] = id end
+    for id in pairs(gaps.npcs) do npcs[#npcs + 1] = id end
+    table.sort(items)
+    table.sort(npcs)
+    local function join(t)
+        local s = {}
+        for i = 1, #t do s[i] = tostring(t[i]) end
+        return table.concat(s, " ")
+    end
+
+    out(string.format("%d gap items, %d gap npcs (no data in any source = Forever-specific candidates)", #items, #npcs))
+    if #items > 0 then out("items: " .. join(items)) end
+    if #npcs > 0 then out("npcs:  " .. join(npcs)) end
+    out("These persist across sessions (SavedVariables). |cffffd100/dct gaps export|r opens a copyable")
+    out("block to paste into a GitHub issue; /dct gaps clear to reset.")
+end
+
 local function installSlashCommands()
     SLASH_DROPCHANCETOOLTIP1 = "/dct"
     SLASH_DROPCHANCETOOLTIP2 = "/dc"
@@ -2381,6 +2597,11 @@ local function installSlashCommands()
 
         if sub == "npc" then
             runNpcDump(args[2])
+            return
+        end
+
+        if sub == "gaps" then
+            runGapsCommand(args[2])
             return
         end
 
@@ -2437,10 +2658,10 @@ local function installSlashCommands()
 
         if DEFAULT_CHAT_FRAME and DEFAULT_CHAT_FRAME.AddMessage then
             DEFAULT_CHAT_FRAME:AddMessage(string.format("|cff66ccffDCT|r Unknown command: %s", command))
-            DEFAULT_CHAT_FRAME:AddMessage("|cff66ccffDCT|r Usage: /dct toggle|on|off | various | npc [id] | settings | debugchat | diag")
+            DEFAULT_CHAT_FRAME:AddMessage("|cff66ccffDCT|r Usage: /dct toggle|on|off | various | npc [id] | gaps [export|clear|test] | settings | debugchat | diag")
         else
             print(string.format("|cff66ccffDCT|r Unknown command: %s", command))
-            print("|cff66ccffDCT|r Usage: /dct toggle|on|off | various | npc [id] | settings | debugchat | diag")
+            print("|cff66ccffDCT|r Usage: /dct toggle|on|off | various | npc [id] | gaps [export|clear|test] | settings | debugchat | diag")
         end
     end
 end
@@ -2461,6 +2682,16 @@ DropChanceTooltip:SetScript("OnEvent", function(_, event, arg1)
 
     if event == "QUEST_LOG_UPDATE" then
         questObjectivesDirty = true
+        return
+    end
+
+    if event == "PLAYER_CAMPING" or event == "PLAYER_QUITING" then
+        nudgeGapsExport("logout")
+        return
+    end
+
+    if event == "ZONE_CHANGED_NEW_AREA" then
+        nudgeGapsExport("zone")
         return
     end
 

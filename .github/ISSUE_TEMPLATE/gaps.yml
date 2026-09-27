@@ -1,0 +1,26 @@
+name: Drop-data gaps
+description: Contribute mobs/items that had no drop data in-game (from `/dct gaps export`).
+title: "[gaps] contribution"
+labels: ["gaps"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        In-game, run **`/dct gaps export`**, press **Ctrl+C** to copy the block, and paste the whole
+        thing below. These are open-world mobs / items DropChanceTooltip could show no drop data for —
+        the Forever-specific candidates a targeted Wowhead scrape should cover. No character-identifying
+        info is included.
+  - type: textarea
+    id: block
+    attributes:
+      label: Gaps block
+      description: Paste the full `/dct gaps export` output (lines beginning `npc:` / `item:`).
+      render: text
+      placeholder: |
+        DropChanceTooltip gaps | client 1.60.1 build 69893 | 2 npcs, 1 items
+        ## NPCs
+        npc:1782  Moonrage Whitescalp  [Silverpine Forest]  lvl12  x5  (2026-09-27)
+        ## Items
+        item:3157  Darksoul Shackle  x2  (2026-09-27)
+    validations:
+      required: true

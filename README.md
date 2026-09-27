@@ -31,6 +31,7 @@ by astroVermilion), which must be installed alongside it.
   filters, per-group show/collapse/hide, "expand all", "always show quest items", and the min‑%
   slider.
 - `/dct diag`, `/dct npc [id]` — diagnostics (load/hook state; raw indexed drops for a mob).
+- `/dct gaps [export|clear|test]` — the drop-data gap collector (see below).
 
 ## Requirements
 
@@ -47,6 +48,23 @@ tables — **no runtime Questie dependency**.
 - **Re-run after QuestieDB updates:** `python3 tools/harvest_questie_drops.py` (regenerates the file
   in place; it's committed so the addon needs no Python at runtime). The generated file is
   auto-generated — do not edit it by hand.
+
+## Contributing drop-data gaps
+
+When you hover an open-world mob (or an item) that has **no drop data in any source**, the addon
+quietly records it — with name/zone/level/count — into its SavedVariables. These "gaps" are the
+Forever-specific candidates a targeted scrape should cover. They **persist across sessions**, so you
+don't have to export before logging out.
+
+- `/dct gaps` — list what's been collected.
+- `/dct gaps export` — open a copyable block (Ctrl+C). Paste it into a new issue via the **Drop-data
+  gaps** template at `github.com/defnotjec/DropChanceTooltip-Forever/issues/new?template=gaps.yml`.
+- `/dct gaps test` — inject a synthetic entry to see the flow; `/dct gaps clear` to reset.
+
+A GitHub Action (`.github/workflows/collect-gaps.yml`) parses submitted issues with `tools/ingest_gaps.py`
+and merges new ids into the scrape hit lists — consolidating gaps across sessions/players into one
+scan list. NPC gaps are high-signal (a mob with no drop table is a real candidate); item gaps are
+noisier (worn/quest/vendor gear that was never a mob drop). See `tools/DATA_PIPELINE.md`.
 
 ## Roadmap
 

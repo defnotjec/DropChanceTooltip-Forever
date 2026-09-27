@@ -2,3 +2,5 @@
 *.orig
 # macOS
 .DS_Store
+tools/.wowhead_cache/
+tools/.wowhead_manifest.json

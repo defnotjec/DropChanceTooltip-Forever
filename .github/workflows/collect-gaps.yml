@@ -1,0 +1,53 @@
+name: Collect drop-data gaps
+
+# When a "gaps" issue is opened/edited, parse the pasted /dct gaps export block and merge any new
+# npc/item ids into the scraper hit lists (tools/scrape_npcs.txt, tools/scrape_ids.txt), then commit.
+# This consolidates gaps gathered across sessions/players into one scan list.
+
+on:
+  issues:
+    types: [opened, edited]
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  ingest:
+    if: contains(join(github.event.issue.labels.*.name, ','), 'gaps')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parse the issue body into the hit lists
+        env:
+          BODY: ${{ github.event.issue.body }}
+        run: |
+          printf '%s' "$BODY" > /tmp/gaps_body.txt
+          python3 tools/ingest_gaps.py --body-file /tmp/gaps_body.txt | tee /tmp/ingest_out.txt
+
+      - name: Commit any additions
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet -- tools/scrape_npcs.txt tools/scrape_ids.txt; then
+            echo "no new ids" >> "$GITHUB_STEP_SUMMARY"
+          else
+            git add tools/scrape_npcs.txt tools/scrape_ids.txt
+            git commit -m "gaps: ingest ids from issue #${{ github.event.issue.number }}"
+            git push
+          fi
+
+      - name: Acknowledge on the issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let out = '';
+            try { out = fs.readFileSync('/tmp/ingest_out.txt', 'utf8'); } catch (e) {}
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: "Thanks — ingested into the scrape hit lists:\n\n```\n" + out + "\n```",
+            });

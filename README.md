@@ -32,6 +32,7 @@ by astroVermilion), which must be installed alongside it.
   slider.
 - `/dct diag`, `/dct npc [id]` — diagnostics (load/hook state; raw indexed drops for a mob).
 - `/dct gaps [export|clear|test]` — the drop-data gap collector (see below).
+- `/dct count [selfbags|selfbank|altsbags|altsbank|consolidate]` — toggle the item-tooltip owned counts.
 
 ## Requirements
 
@@ -48,6 +49,35 @@ tables — **no runtime Questie dependency**.
 - **Re-run after QuestieDB updates:** `python3 tools/harvest_questie_drops.py` (regenerates the file
   in place; it's committed so the addon needs no Python at runtime). The generated file is
   auto-generated — do not edit it by hand.
+
+## Owned counts on item tooltips
+
+Hovering an item shows how many you own. By default it's a single grand total:
+
+```
+You have        54
+```
+
+Hold **Shift** to expand it — everything on-person first (you, then each other character), a blank
+line, then a **Bank** section with each character:
+
+```
+You have        34
+  Alt            8
+                                (spacer)
+Bank
+  You           20
+```
+
+Counts come from live `GetItemCount` for the current character and per-character bag/bank snapshots
+recorded as you play (and open the bank on) each one. Five toggles, in the options panel (Item column)
+or via `/dct count`:
+
+- `selfbags`, `selfbank`, `altsbags`, `altsbank` — what's included in the total and the breakdown.
+- `consolidate` — show the split on the collapsed line too: `You have  54 (34 bags, 20 bank)`.
+
+Alt counts only appear for characters you've logged into since installing this; bank figures update
+when you open that character's bank.
 
 ## Contributing drop-data gaps
 

@@ -4,6 +4,12 @@ local ADDON_NAME = ...
 -- return signature). Bind a local so every GetItemInfo(...) call in this file works on both.
 local GetItemInfo = GetItemInfo or (C_Item and C_Item.GetItemInfo)
 local GetItemInfoInstant = GetItemInfoInstant or (C_Item and C_Item.GetItemInfoInstant)
+-- Item-count feature: GetItemCount(id[, includeBank]) and the C_Container reads (globals were
+-- moved under C_Item / C_Container on modern clients; fall back to the old globals if present).
+local GetItemCount = GetItemCount or (C_Item and C_Item.GetItemCount)
+local GetContainerNumSlots = (C_Container and C_Container.GetContainerNumSlots) or _G.GetContainerNumSlots
+local GetContainerItemID = (C_Container and C_Container.GetContainerItemID) or _G.GetContainerItemID
+local GetContainerItemInfo = (C_Container and C_Container.GetContainerItemInfo) or _G.GetContainerItemInfo
 local QUEST_ITEM_CLASS = (Enum and Enum.ItemClass and Enum.ItemClass.Questitem) or 12
 local GEM_ITEM_CLASS = (Enum and Enum.ItemClass and Enum.ItemClass.Gem) or 3
 local RECIPE_ITEM_CLASS = (Enum and Enum.ItemClass and Enum.ItemClass.Recipe) or 9
@@ -224,12 +230,24 @@ local function installMobDropIndex()
 end
 
 local DropChanceTooltip = CreateFrame("Frame")
-DropChanceTooltip:RegisterEvent("ADDON_LOADED")
-DropChanceTooltip:RegisterEvent("MODIFIER_STATE_CHANGED")
-DropChanceTooltip:RegisterEvent("QUEST_LOG_UPDATE")
-DropChanceTooltip:RegisterEvent("PLAYER_CAMPING")           -- logout timer started
-DropChanceTooltip:RegisterEvent("PLAYER_QUITING")           -- quit timer started
-DropChanceTooltip:RegisterEvent("ZONE_CHANGED_NEW_AREA")    -- throttled reminder while roaming
+-- Register defensively: RegisterEvent throws on an event name this (Forever) client doesn't know,
+-- and an unguarded throw here would abort the entire addon load (no slash commands, no tooltips).
+-- pcall so a missing event just quietly disables its own feature.
+local function dctRegisterEvent(event)
+    pcall(DropChanceTooltip.RegisterEvent, DropChanceTooltip, event)
+end
+dctRegisterEvent("ADDON_LOADED")
+dctRegisterEvent("MODIFIER_STATE_CHANGED")
+dctRegisterEvent("QUEST_LOG_UPDATE")
+dctRegisterEvent("PLAYER_CAMPING")           -- logout timer started
+dctRegisterEvent("PLAYER_QUITING")           -- quit timer started
+dctRegisterEvent("ZONE_CHANGED_NEW_AREA")    -- throttled reminder while roaming
+dctRegisterEvent("PLAYER_ENTERING_WORLD")    -- initial inventory snapshot
+dctRegisterEvent("BAG_UPDATE_DELAYED")       -- bags changed -> re-snapshot carried
+dctRegisterEvent("BANKFRAME_OPENED")         -- bank readable -> snapshot bank
+dctRegisterEvent("BANKFRAME_CLOSED")
+dctRegisterEvent("PLAYERBANKSLOTS_CHANGED")  -- bank contents changed while open
+dctRegisterEvent("PLAYERBANKBAGSLOTS_CHANGED")
 
 local debugEnabled = false
 local modernHooksInstalled = false
@@ -267,12 +285,25 @@ local defaultSettings = {
     -- Quest items: by default only show them on a mob when they match an objective of a quest you're
     -- currently on. Override to always show them regardless.
     alwaysShowQuestItems = false,
+    -- Quest items below this % are phantom noise (there is never a real quest drop under ~1%), so we
+    -- drop them from the Quest Items section regardless of the on-quest filter. Shift reveals them.
+    minQuestChancePercent = 1.0,
     -- Per-group display for the collapsible "various X" categories: "collapse" | "expand" | "hidden".
     variousMode = {
         gems = "collapse", patterns = "collapse", schematics = "collapse",
         enchants = "collapse", recipes = "collapse", scrolls = "collapse", greens = "collapse",
     },
     expandAllVarious = false,  -- persistent "always expand every various group"
+    -- Item tooltip: show how many of the item you (and your other characters) own. Self counts are
+    -- live (GetItemCount); alt counts come from per-character bag/bank snapshots in SavedVariables.
+    -- Four independent toggles; Shift breaks the alt total down per character.
+    showSelfBags = true,
+    showSelfBank = true,
+    showAltsBags = false,
+    showAltsBank = false,
+    -- Collapsed line shows just the grand total ("You have  54"); consolidated appends the split
+    -- ("You have  54 (34 bags, 20 bank)"). Shift always expands to the full per-character breakdown.
+    countConsolidated = false,
     showItemByRarity = {
         [0] = true, -- Poor
         [1] = true, -- Common
@@ -337,6 +368,17 @@ local function ensureSettings()
     end
     if DropChanceTooltipDB.alwaysShowQuestItems == nil then
         DropChanceTooltipDB.alwaysShowQuestItems = defaultSettings.alwaysShowQuestItems
+    end
+    if DropChanceTooltipDB.minQuestChancePercent == nil then
+        DropChanceTooltipDB.minQuestChancePercent = defaultSettings.minQuestChancePercent
+    end
+    for _, key in ipairs({ "showSelfBags", "showSelfBank", "showAltsBags", "showAltsBank", "countConsolidated" }) do
+        if DropChanceTooltipDB[key] == nil then
+            DropChanceTooltipDB[key] = defaultSettings[key]
+        end
+    end
+    if type(DropChanceTooltipDB.inventory) ~= "table" then
+        DropChanceTooltipDB.inventory = {}  -- [charKey] = {name,realm,class,faction,bags={},bank={},updated}
     end
     -- Evidence log of Forever-specific gaps found through play: items/npcs we tried to show but
     -- had NO data for in any source. Exported via /dct gaps to seed the targeted Wowhead scrape.
@@ -1247,6 +1289,188 @@ local function getVisibleSourceCount(quality, expanded, total)
     return math.min(total, base)
 end
 
+-- ------------------------------------------------------------------------------------------------
+-- Item-count across your characters (shown on the item tooltip). Self counts are live via
+-- GetItemCount; other characters' counts come from bag/bank snapshots we record into account-wide
+-- SavedVariables as you play (and open the bank on) each one.
+-- ------------------------------------------------------------------------------------------------
+local function charKey()
+    local name = UnitName and UnitName("player")
+    if not name then return nil end
+    local realm = (GetRealmName and GetRealmName()) or ""
+    return name .. "-" .. realm
+end
+
+-- Sum stack counts across a list of container ids -> { [itemID] = count }.
+local function scanContainers(bagList)
+    local counts = {}
+    if not GetContainerNumSlots then return counts end
+    for _, bag in ipairs(bagList) do
+        local slots = GetContainerNumSlots(bag) or 0
+        for slot = 1, slots do
+            local id = GetContainerItemID and GetContainerItemID(bag, slot)
+            local stack = 1
+            local info = GetContainerItemInfo and GetContainerItemInfo(bag, slot)
+            if type(info) == "table" then
+                id = id or info.itemID
+                stack = info.stackCount or 1
+            end
+            if id then counts[id] = (counts[id] or 0) + stack end
+        end
+    end
+    return counts
+end
+
+local CARRIED_BAGS = { 0 }  -- backpack + carried bags (0..NUM_BAG_SLOTS)
+do
+    for i = 1, (NUM_BAG_SLOTS or 4) do CARRIED_BAGS[#CARRIED_BAGS + 1] = i end
+end
+
+local function bankContainers()
+    local list = { BANK_CONTAINER or -1 }
+    if REAGENTBANK_CONTAINER then list[#list + 1] = REAGENTBANK_CONTAINER end
+    local base = NUM_BAG_SLOTS or 4
+    for i = 1, (NUM_BANKBAGSLOTS or 6) do list[#list + 1] = base + i end
+    return list
+end
+
+local _bankIsOpen = false
+
+local function currentCharSnapshot()
+    local key = charKey()
+    if not key then return nil end
+    ensureSettings()
+    local inv = DropChanceTooltipDB.inventory
+    local snap = inv[key]
+    if type(snap) ~= "table" then
+        snap = {}
+        inv[key] = snap
+    end
+    snap.name = (UnitName and UnitName("player")) or snap.name
+    snap.realm = (GetRealmName and GetRealmName()) or snap.realm
+    snap.class = (UnitClass and select(2, UnitClass("player"))) or snap.class
+    snap.faction = (UnitFactionGroup and UnitFactionGroup("player")) or snap.faction
+    snap.updated = (date and date("%Y-%m-%d")) or snap.updated
+    return snap
+end
+
+local function snapshotBags()
+    local snap = currentCharSnapshot()
+    if snap then snap.bags = scanContainers(CARRIED_BAGS) end
+end
+
+-- Only scan the bank while it is OPEN -- closed bank containers report 0 slots, which would wipe the
+-- stored snapshot to empty.
+local function snapshotBank()
+    if not _bankIsOpen then return end
+    local snap = currentCharSnapshot()
+    if snap then snap.bank = scanContainers(bankContainers()) end
+end
+
+local function classColorHex(classFile)
+    local c = classFile and RAID_CLASS_COLORS and RAID_CLASS_COLORS[classFile]
+    if c and c.colorStr then return c.colorStr end
+    if c then return string.format("ff%02x%02x%02x", (c.r or 1) * 255, (c.g or 1) * 255, (c.b or 1) * 255) end
+    return "ffffffff"
+end
+
+local function addOwnedCountsToTooltip(tooltip)
+    if not tooltip then return end
+    ensureSettings()
+    local db = DropChanceTooltipDB
+    if db.enabled == false then return end
+    if not (db.showSelfBags or db.showSelfBank or db.showAltsBags or db.showAltsBank) then return end
+    local itemID = getItemIDFromTooltip(tooltip)
+    if not itemID then return end
+
+    local expanded = IsShiftKeyDown()
+    local sig = string.format("cnt:%d:%s:%s%s%s%s:%s", itemID, expanded and "1" or "0",
+        db.showSelfBags and "1" or "0", db.showSelfBank and "1" or "0",
+        db.showAltsBags and "1" or "0", db.showAltsBank and "1" or "0",
+        db.countConsolidated and "1" or "0")
+    if tooltip.__dctCountSig == sig then return end
+    tooltip.__dctCountSig = sig
+
+    -- self (live): GetItemCount(id) = bags only; GetItemCount(id, true) = bags + bank.
+    local selfBags = (GetItemCount and GetItemCount(itemID)) or 0
+    local selfTotal = (GetItemCount and GetItemCount(itemID, true)) or selfBags
+    local selfBank = math.max(selfTotal - selfBags, 0)
+
+    -- other characters (snapshots).
+    local curKey = charKey()
+    local alts = {}  -- { name, class, bags, bank }
+    for key, snap in pairs(db.inventory or {}) do
+        if key ~= curKey and type(snap) == "table" then
+            local b = (snap.bags and snap.bags[itemID]) or 0
+            local k = (snap.bank and snap.bank[itemID]) or 0
+            if b > 0 or k > 0 then
+                alts[#alts + 1] = { name = snap.name or key, class = snap.class, bags = b, bank = k }
+            end
+        end
+    end
+    table.sort(alts, function(a, b) return (a.bags + a.bank) > (b.bags + b.bank) end)
+
+    local altBagsSum, altBankSum = 0, 0
+    for _, a in ipairs(alts) do
+        altBagsSum, altBankSum = altBagsSum + a.bags, altBankSum + a.bank
+    end
+
+    -- Portions honoring the four toggles. bags = "on person", bank = stored.
+    local bagsPortion = (db.showSelfBags and selfBags or 0) + (db.showAltsBags and altBagsSum or 0)
+    local bankPortion = (db.showSelfBank and selfBank or 0) + (db.showAltsBank and altBankSum or 0)
+    local grand = bagsPortion + bankPortion
+    if grand <= 0 then return end
+
+    local function nameColored(name, class)
+        return string.format("|c%s%s|r", classColorHex(class), name)
+    end
+
+    tooltip:AddLine(" ")
+
+    if not expanded then
+        -- Collapsed: a single grand-total line. "Consolidated" mode appends the bags/bank split.
+        local value = tostring(grand)
+        if db.countConsolidated then
+            local parts = {}
+            if bagsPortion > 0 then parts[#parts + 1] = bagsPortion .. " bags" end
+            if bankPortion > 0 then parts[#parts + 1] = bankPortion .. " bank" end
+            if #parts > 0 then value = value .. " (" .. table.concat(parts, ", ") .. ")" end
+        end
+        tooltip:AddDoubleLine("You have", value, 1, 0.82, 0, 1, 1, 1)
+        return
+    end
+
+    -- Expanded: everything on-person first (you, then each alt), a spacer, then the Bank section.
+    local wroteOnPerson = false
+    if db.showSelfBags and selfBags > 0 then
+        tooltip:AddDoubleLine("You have", tostring(selfBags), 1, 0.82, 0, 1, 1, 1)
+        wroteOnPerson = true
+    end
+    if db.showAltsBags then
+        for _, a in ipairs(alts) do
+            if a.bags > 0 then
+                tooltip:AddDoubleLine("  " .. nameColored(a.name, a.class), tostring(a.bags), 1, 1, 1, 0.8, 0.8, 0.8)
+                wroteOnPerson = true
+            end
+        end
+    end
+
+    local bankRows = {}
+    if db.showSelfBank and selfBank > 0 then bankRows[#bankRows + 1] = { label = "You", value = selfBank } end
+    if db.showAltsBank then
+        for _, a in ipairs(alts) do
+            if a.bank > 0 then bankRows[#bankRows + 1] = { label = nameColored(a.name, a.class), value = a.bank } end
+        end
+    end
+    if #bankRows > 0 then
+        if wroteOnPerson then tooltip:AddLine(" ") end
+        tooltip:AddLine("Bank", 1, 0.82, 0)
+        for _, r in ipairs(bankRows) do
+            tooltip:AddDoubleLine("  " .. r.label, tostring(r.value), 1, 1, 1, 0.8, 0.8, 0.8)
+        end
+    end
+end
+
 local function addDropDataToTooltip(tooltip)
     if not tooltip then
         return
@@ -1476,9 +1700,15 @@ local function addMobDropDataToTooltip(tooltip)
     if #buckets.quest > 0 then
         local alwaysShow = expanded
             or (DropChanceTooltipDB and DropChanceTooltipDB.alwaysShowQuestItems)
+        -- Phantom-noise floor for quest items (separate from the commons floor + the on-quest filter):
+        -- real quest drops are never sub-~1%, so prune those unless Shift is held.
+        local minQuestPct = (DropChanceTooltipDB and DropChanceTooltipDB.minQuestChancePercent)
+            or defaultSettings.minQuestChancePercent
+        local minQuestRaw = (tonumber(minQuestPct) or 0) * 100  -- chance is ten-thousandths
         local questShown = {}
         for _, drop in ipairs(buckets.quest) do
-            if alwaysShow or isQuestDropRelevant(drop) then
+            local passesFloor = expanded or (drop.chance or 0) >= minQuestRaw
+            if passesFloor and (alwaysShow or isQuestDropRelevant(drop)) then
                 questShown[#questShown + 1] = drop
             end
         end
@@ -1640,11 +1870,12 @@ local function clearTooltipState(tooltip)
         return
     end
 
-    if tooltip.__dctSignature or tooltip.__dctMobSignature then
+    if tooltip.__dctSignature or tooltip.__dctMobSignature or tooltip.__dctCountSig then
         debugPrint("clearTooltipState: reset signatures")
     end
     tooltip.__dctSignature = nil
     tooltip.__dctMobSignature = nil
+    tooltip.__dctCountSig = nil
 end
 
 local function captureOrigin(tooltip, methodName, ...)
@@ -1680,6 +1911,7 @@ local function rerenderTooltip(tooltip)
     end
 
     tooltip.__dctSignature = nil
+    tooltip.__dctCountSig = nil
     tooltip.__dctLastShiftState = shiftState
     if tooltip == ItemRefTooltip and methodName == "SetHyperlink" then
         tooltip.__dctLastShiftState = shiftState
@@ -1708,6 +1940,7 @@ local function attachTooltip(tooltip)
         if not hasModernProcessor then
             tooltip:HookScript("OnTooltipSetItem", function(t)
                 addDropDataToTooltip(t)
+                addOwnedCountsToTooltip(t)
             end)
 
             tooltip:HookScript("OnTooltipSetUnit", function(t)
@@ -1798,6 +2031,7 @@ local function installTooltipHooks()
         TooltipDataProcessor.AddTooltipPostCall(Enum.TooltipDataType.Item, function(tooltip, data)
             tooltip.__dctData = data
             addDropDataToTooltip(tooltip)
+            addOwnedCountsToTooltip(tooltip)
         end)
 
         TooltipDataProcessor.AddTooltipPostCall(Enum.TooltipDataType.Unit, function(tooltip, data)
@@ -2076,6 +2310,37 @@ local function createSettingsPanel()
         previousMob = mobCheck
     end
 
+    -- ---- Item tooltip: owned counts (self + alts), below the item-rarity column -----------------
+    local countSubtitle = panel:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+    countSubtitle:SetPoint("TOPLEFT", previousItem, "BOTTOMLEFT", -16, -14)
+    countSubtitle:SetText("Item tooltip: owned counts")
+
+    panel.countChecks = {}
+    local countSpec = {
+        { key = "showSelfBags", label = "Your bags" },
+        { key = "showSelfBank", label = "Your bank" },
+        { key = "showAltsBags", label = "Alts' bags" },
+        { key = "showAltsBank", label = "Alts' bank" },
+        { key = "countConsolidated", label = "Consolidated total (n bags, n bank)" },
+    }
+    local prevCount
+    for _, spec in ipairs(countSpec) do
+        local check = CreateFrame("CheckButton", nil, panel, "InterfaceOptionsCheckButtonTemplate")
+        check.dbKey = spec.key
+        setCheckButtonLabel(check, spec.label)
+        if not prevCount then
+            check:SetPoint("TOPLEFT", countSubtitle, "BOTTOMLEFT", 16, -6)
+        else
+            check:SetPoint("TOPLEFT", prevCount, "BOTTOMLEFT", 0, -4)
+        end
+        check:SetScript("OnClick", function(self)
+            ensureSettings()
+            DropChanceTooltipDB[self.dbKey] = self:GetChecked() and true or false
+        end)
+        panel.countChecks[spec.key] = check
+        prevCount = check
+    end
+
     -- ---- Mob tooltip: "various X" groups + drop-chance floor (third column) ------------------
     local variousSubtitle = panel:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
     variousSubtitle:SetPoint("TOPLEFT", title, "BOTTOMLEFT", 400, -8)
@@ -2189,6 +2454,11 @@ local function createSettingsPanel()
         if panel.questAlwaysCheck then
             panel.questAlwaysCheck:SetChecked(DropChanceTooltipDB.alwaysShowQuestItems == true)
         end
+        if panel.countChecks then
+            for key, check in pairs(panel.countChecks) do
+                check:SetChecked(DropChanceTooltipDB[key] == true)
+            end
+        end
         for _, key in ipairs(GROUP_ORDER) do
             local mode = DropChanceTooltipDB.variousMode[key] or "collapse"
             local showCheck = panel.groupShow[key]
@@ -2271,6 +2541,7 @@ function DropChanceTooltip_Toggle(force)
     if GameTooltip then
         GameTooltip.__dctSignature = nil
         GameTooltip.__dctMobSignature = nil
+        GameTooltip.__dctCountSig = nil
         if GameTooltip.IsShown and GameTooltip:IsShown() and GameTooltip.Hide then
             GameTooltip:Hide()
         end
@@ -2584,6 +2855,32 @@ local function runGapsCommand(arg)
     out("block to paste into a GitHub issue; /dct gaps clear to reset.")
 end
 
+-- /dct count [selfbags|selfbank|altsbags|altsbank]: toggle the item-tooltip count lines, or list state.
+local function runCountCommand(arg)
+    local function out(msg)
+        local line = "|cff66ccffDCT-COUNT|r " .. tostring(msg)
+        if DEFAULT_CHAT_FRAME and DEFAULT_CHAT_FRAME.AddMessage then DEFAULT_CHAT_FRAME:AddMessage(line) else print(line) end
+    end
+    ensureSettings()
+    local map = {
+        selfbags = "showSelfBags", selfbank = "showSelfBank",
+        altsbags = "showAltsBags", altsbank = "showAltsBank",
+        consolidate = "countConsolidated",
+    }
+    local a = arg and arg:lower() or ""
+    if map[a] then
+        DropChanceTooltipDB[map[a]] = not DropChanceTooltipDB[map[a]]
+        out(a .. " = " .. tostring(DropChanceTooltipDB[map[a]]))
+        return
+    end
+    out("item-count toggles (hover shows the grand total; Shift expands per character):")
+    out(string.format("  self bags: %s  ·  self bank: %s  ·  alts bags: %s  ·  alts bank: %s  ·  consolidated: %s",
+        tostring(DropChanceTooltipDB.showSelfBags), tostring(DropChanceTooltipDB.showSelfBank),
+        tostring(DropChanceTooltipDB.showAltsBags), tostring(DropChanceTooltipDB.showAltsBank),
+        tostring(DropChanceTooltipDB.countConsolidated)))
+    out("toggle with: /dct count selfbags | selfbank | altsbags | altsbank | consolidate")
+end
+
 local function installSlashCommands()
     SLASH_DROPCHANCETOOLTIP1 = "/dct"
     SLASH_DROPCHANCETOOLTIP2 = "/dc"
@@ -2602,6 +2899,11 @@ local function installSlashCommands()
 
         if sub == "gaps" then
             runGapsCommand(args[2])
+            return
+        end
+
+        if sub == "count" then
+            runCountCommand(args[2])
             return
         end
 
@@ -2658,10 +2960,10 @@ local function installSlashCommands()
 
         if DEFAULT_CHAT_FRAME and DEFAULT_CHAT_FRAME.AddMessage then
             DEFAULT_CHAT_FRAME:AddMessage(string.format("|cff66ccffDCT|r Unknown command: %s", command))
-            DEFAULT_CHAT_FRAME:AddMessage("|cff66ccffDCT|r Usage: /dct toggle|on|off | various | npc [id] | gaps [export|clear|test] | settings | debugchat | diag")
+            DEFAULT_CHAT_FRAME:AddMessage("|cff66ccffDCT|r Usage: /dct toggle|on|off | various | count | npc [id] | gaps [export|clear|test] | settings | debugchat | diag")
         else
             print(string.format("|cff66ccffDCT|r Unknown command: %s", command))
-            print("|cff66ccffDCT|r Usage: /dct toggle|on|off | various | npc [id] | gaps [export|clear|test] | settings | debugchat | diag")
+            print("|cff66ccffDCT|r Usage: /dct toggle|on|off | various | count | npc [id] | gaps [export|clear|test] | settings | debugchat | diag")
         end
     end
 end
@@ -2692,6 +2994,27 @@ DropChanceTooltip:SetScript("OnEvent", function(_, event, arg1)
 
     if event == "ZONE_CHANGED_NEW_AREA" then
         nudgeGapsExport("zone")
+        return
+    end
+
+    if event == "PLAYER_ENTERING_WORLD" or event == "BAG_UPDATE_DELAYED" then
+        snapshotBags()
+        return
+    end
+
+    if event == "BANKFRAME_OPENED" then
+        _bankIsOpen = true
+        snapshotBank()
+        return
+    end
+
+    if event == "BANKFRAME_CLOSED" then
+        _bankIsOpen = false
+        return
+    end
+
+    if event == "PLAYERBANKSLOTS_CHANGED" or event == "PLAYERBANKBAGSLOTS_CHANGED" then
+        snapshotBank()  -- no-op unless the bank is open
         return
     end
 

@@ -252,8 +252,6 @@ dctRegisterEvent("PLAYERBANKBAGSLOTS_CHANGED")
 
 local debugEnabled = false
 local modernHooksInstalled = false
-local settingsWindow
-local settingsPanel
 local settingsCategoryID
 local settingsCategory
 
@@ -317,6 +315,18 @@ local defaultSettings = {
     -- drop named/unique mobs (a fixed single level) and elites/rares (rank>0). Best for limited items
     -- like textiles. Toggle with /dct mattrash.
     materialTrashOnly = true,
+    -- Profession skill-requirement display (gather nodes, skinnable beasts/corpses). Independent per
+    -- profession: `enabled` off hides it entirely; on shows it when you own the profession;
+    -- `showWithoutProfession` also shows it when you don't (the "override"). Defaults have the override
+    -- ON so the info is visible while testing even without the profession -- flip to false to ship the
+    -- own-it-to-see-it gating. Structured as one row per profession for the future settings menu.
+    professions = {
+        mining    = { enabled = true, showWithoutProfession = true },
+        herbalism = { enabled = true, showWithoutProfession = true },
+        skinning  = { enabled = true, showWithoutProfession = true },
+    },
+    -- Options window: use the bundled Expressway font (EllesmereUI look) vs the default game font.
+    useExpresswayFont = true,
     showItemByRarity = {
         [0] = true, -- Poor
         [1] = true, -- Common
@@ -393,6 +403,21 @@ local function ensureSettings()
     end
     if DropChanceTooltipDB.materialTrashOnly == nil then
         DropChanceTooltipDB.materialTrashOnly = defaultSettings.materialTrashOnly
+    end
+    if type(DropChanceTooltipDB.professions) ~= "table" then
+        DropChanceTooltipDB.professions = {}
+    end
+    for profKey, profDefault in pairs(defaultSettings.professions) do
+        local p = DropChanceTooltipDB.professions[profKey]
+        if type(p) ~= "table" then
+            p = {}
+            DropChanceTooltipDB.professions[profKey] = p
+        end
+        if p.enabled == nil then p.enabled = profDefault.enabled end
+        if p.showWithoutProfession == nil then p.showWithoutProfession = profDefault.showWithoutProfession end
+    end
+    if DropChanceTooltipDB.useExpresswayFont == nil then
+        DropChanceTooltipDB.useExpresswayFont = defaultSettings.useExpresswayFont
     end
     for _, key in ipairs({ "showSelfBags", "showSelfBank", "showAltsBags", "showAltsBank", "countConsolidated", "countIncludeAlts" }) do
         if DropChanceTooltipDB[key] == nil then
@@ -2171,6 +2196,170 @@ local function addMobDropDataToTooltip(tooltip)
     tooltip:AddLine(" ") -- visual break after our drops block
 end
 
+-- ---------------------------------------------------------------------------------------------
+-- Profession skill requirements: gather nodes (Mining/Herbalism) + skinnable beasts (Skinning).
+-- ---------------------------------------------------------------------------------------------
+
+-- Player's current skill in a profession by localized name (e.g. "Mining"). Returns have, skill, max.
+-- Uses the retail-engine global GetProfessions/GetProfessionInfo (confirmed on this client;
+-- C_TradeSkillUI.GetProfessions and the old GetSkillLineInfo are both absent). Read live per tooltip
+-- (cheap: <=6 calls) so a skill-up shows immediately without cache invalidation.
+local function getProfSkill(profName)
+    if type(GetProfessions) ~= "function" or type(GetProfessionInfo) ~= "function" then
+        return false
+    end
+    local profs = { GetProfessions() }  -- prof1, prof2, archaeology, fishing, cooking, firstAid
+    for _, idx in pairs(profs) do
+        if idx then
+            local n, _, skill, maxSkill = GetProfessionInfo(idx)
+            if n == profName then
+                return true, skill, maxSkill
+            end
+        end
+    end
+    return false
+end
+
+-- Per-profession gate. key = "mining"|"herbalism"|"skinning"; profName = its localized name.
+-- Returns shown, skill (skill is nil when shown only via the showWithoutProfession override).
+local function professionShown(key, profName)
+    ensureSettings()
+    local p = DropChanceTooltipDB.professions and DropChanceTooltipDB.professions[key]
+    if not p or not p.enabled then
+        return false
+    end
+    local have, skill = getProfSkill(profName)
+    if have then
+        return true, skill
+    end
+    if p.showWithoutProfession then
+        return true, nil
+    end
+    return false
+end
+
+-- Classic gathering difficulty color for a requirement R vs the player's skill S. Ramp:
+-- red (can't) -> orange -> yellow -> green -> grey (trivial at R+100). No skill at all (missing the
+-- profession, or below the requirement) means you can't gather/skin it -> red.
+local function gatherColor(req, skill)
+    if not req then return 0.8, 0.8, 0.8 end             -- unknown requirement -> neutral
+    if not skill or skill <= 0 then return 1.0, 0.1, 0.1 end  -- don't have the skill -> can't -> red
+    if skill < req then return 1.0, 0.1, 0.1 end         -- impossible
+    local d = skill - req
+    if d >= 100 then return 0.5, 0.5, 0.5 end            -- trivial (grey)
+    if d >= 50  then return 0.25, 0.75, 0.25 end         -- easy (green)
+    if d >= 25  then return 1.0, 1.0, 0.0 end            -- medium (yellow)
+    return 1.0, 0.5, 0.0                                 -- hard (orange)
+end
+
+local function colorText(text, r, g, b)
+    return string.format("|cff%02x%02x%02x%s|r",
+        math.floor(r * 255 + 0.5), math.floor(g * 255 + 0.5), math.floor(b * 255 + 0.5), tostring(text))
+end
+
+-- Required skinning skill for a beast of the given level (classic convention: level x 5).
+local function skinningRequirement(level)
+    if not level or level < 1 then return nil end
+    return level * 5
+end
+
+-- First left FontString whose text contains `needle` (plain match); returns FontString, text.
+local function findTooltipLine(tooltip, needle)
+    local name = tooltip and tooltip.GetName and tooltip:GetName()
+    if not name then return nil end
+    for i = 1, tooltip:NumLines() do
+        local fs = _G[name .. "TextLeft" .. i]
+        local text = fs and fs:GetText()
+        if text and text:find(needle, 1, true) then
+            return fs, text
+        end
+    end
+    return nil
+end
+
+-- Object(4) tooltip: Mining/Herbalism gather nodes. Detected by node name (nodes carry no id).
+-- Injects the required skill into the game's "Requires Mining/Herbalism" line as a difficulty-colored
+-- "(N)"; adds the line if the game didn't render one. Node names match ORE_SKILL (vein names) and
+-- HERB_SKILL (herb names) directly. The signature guard also blocks re-entrancy from tooltip:Show().
+local function addGatherNodeInfoToTooltip(tooltip)
+    if not tooltip then return end
+    if DropChanceTooltipDB and DropChanceTooltipDB.enabled == false then return end
+    local nameFS = tooltip.GetName and _G[tooltip:GetName() .. "TextLeft1"]
+    local nodeName = nameFS and nameFS:GetText()
+    if not nodeName then return end
+
+    local key, profName, req, needle
+    if ORE_SKILL[nodeName] then
+        key, profName, req, needle = "mining", "Mining", ORE_SKILL[nodeName], "Mining"
+    elseif HERB_SKILL[nodeName] then
+        key, profName, req, needle = "herbalism", "Herbalism", HERB_SKILL[nodeName], "Herbalism"
+    else
+        return
+    end
+
+    local sig = string.format("node:%s:%d", nodeName, req)
+    if tooltip.__dctNodeSig == sig then return end
+    tooltip.__dctNodeSig = sig
+
+    local shown, skill = professionShown(key, profName)
+    if not shown then return end
+
+    -- Recolor the WHOLE requirement line (not just the number) to the difficulty color, overriding
+    -- the game's default line color. SetTextColor applies to the entire FontString.
+    local r, g, b = gatherColor(req, skill)
+    local fs, text = findTooltipLine(tooltip, needle)
+    if fs then
+        fs:SetText(text .. " (" .. req .. ")")
+        fs:SetTextColor(r, g, b)
+    else
+        tooltip:AddLine("Requires " .. profName .. " (" .. req .. ")", r, g, b)
+    end
+    tooltip:Show()  -- re-layout after editing/adding a line
+end
+
+-- Unit(2) tooltip for beasts: skinning. On this client a dead skinnable beast stays a valid mouseover
+-- and the game adds a "Skinnable" line (its presence == actually skinnable). Dead -> inject the
+-- required skill into that line (task 2). Living Beast -> add a bottom "Skinnable N" line (task 3).
+-- Requirement = level x 5, colored by the gather ramp vs current Skinning. Called after the drop
+-- section so the living-beast line sits at the bottom.
+local function addSkinningInfoToTooltip(tooltip)
+    if not tooltip then return end
+    if DropChanceTooltipDB and DropChanceTooltipDB.enabled == false then return end
+
+    local unit = (UnitExists and UnitExists("mouseover")) and "mouseover" or nil
+    if not unit then return end
+    if not (UnitCreatureType and UnitCreatureType(unit) == "Beast") then return end
+
+    local level = UnitLevel and UnitLevel(unit)
+    local req = skinningRequirement(level)
+    local isDead = UnitIsDead and UnitIsDead(unit) and true or false
+
+    local sig = string.format("skin:%s:%s:%s",
+        tostring(UnitGUID and UnitGUID(unit)), tostring(req), isDead and "d" or "a")
+    if tooltip.__dctSkinSig == sig then return end
+    tooltip.__dctSkinSig = sig
+
+    local shown, skill = professionShown("skinning", "Skinning")
+    if not shown then return end
+
+    -- Recolor the whole "Skinnable" line to the difficulty color (the game paints it green by
+    -- default); no skinning skill -> red via gatherColor.
+    local r, g, b = gatherColor(req, skill)
+    local reqNum = req and tostring(req) or "??"
+
+    if isDead then
+        local fs, text = findTooltipLine(tooltip, "Skinnable")
+        if fs then
+            fs:SetText(text .. " " .. reqNum)
+            fs:SetTextColor(r, g, b)
+            tooltip:Show()
+        end
+    else
+        tooltip:AddLine("Skinnable " .. reqNum, r, g, b)
+        tooltip:Show()
+    end
+end
+
 local function getTooltipTitleText(tooltip)
     if not tooltip or not tooltip.GetName then
         return nil
@@ -2276,6 +2465,8 @@ local function clearTooltipState(tooltip)
     tooltip.__dctSignature = nil
     tooltip.__dctMobSignature = nil
     tooltip.__dctCountSig = nil
+    tooltip.__dctNodeSig = nil
+    tooltip.__dctSkinSig = nil
 end
 
 local function captureOrigin(tooltip, methodName, ...)
@@ -2437,7 +2628,17 @@ local function installTooltipHooks()
         TooltipDataProcessor.AddTooltipPostCall(Enum.TooltipDataType.Unit, function(tooltip, data)
             tooltip.__dctData = data
             addMobDropDataToTooltip(tooltip)
+            addSkinningInfoToTooltip(tooltip)
         end)
+
+        -- Gather nodes (mining/herb) come through the Object tooltip; they carry no numeric id, so
+        -- addGatherNodeInfoToTooltip keys off the node name.
+        if Enum.TooltipDataType.Object then
+            TooltipDataProcessor.AddTooltipPostCall(Enum.TooltipDataType.Object, function(tooltip, data)
+                tooltip.__dctData = data
+                addGatherNodeInfoToTooltip(tooltip)
+            end)
+        end
 
         modernHooksInstalled = true
         debugPrint("Tooltip hooks installed (modern TooltipDataProcessor)")
@@ -2472,455 +2673,659 @@ local function printDebugStatus()
 end
 
 
-local function createSettingsWindow()
-    if settingsWindow then
-        return settingsWindow
-    end
+-- ============================================================================================
+-- Options window -- EllesmereUI-style: left-nav sections + right content with tabs. Fully
+-- self-contained (the Expressway font is bundled under media/fonts, no EllesmereUI dependency).
+-- ============================================================================================
 
-    local frame = CreateFrame("Frame", "DropChanceTooltipSettingsFrame", UIParent, BackdropTemplateMixin and "BackdropTemplate")
-    frame:SetSize(460, 250)
-    frame:SetPoint("CENTER")
-    frame:SetFrameStrata("DIALOG")
-    frame:SetMovable(true)
-    frame:EnableMouse(true)
-    frame:RegisterForDrag("LeftButton")
-    frame:SetScript("OnDragStart", frame.StartMoving)
-    frame:SetScript("OnDragStop", frame.StopMovingOrSizing)
-    frame:Hide()
+local UI = { W = 760, H = 560, SIDEBAR_W = 172, HEADER_H = 56, TABBAR_H = 30, PAD = 18, ROW_H = 30 }
+local ACCENT = { 0.40, 0.80, 1.00 }   -- DCT blue (66ccff)
+local FONT_DEFAULT = "Fonts\\FRIZQT__.TTF"
+local FONT_EXPRESSWAY = "Interface\\AddOns\\DropChanceTooltip\\media\\fonts\\Expressway.ttf"
 
-    if frame.SetBackdrop then
-        frame:SetBackdrop({
-            bgFile = "Interface/Tooltips/UI-Tooltip-Background",
-            edgeFile = "Interface/Tooltips/UI-Tooltip-Border",
-            tile = true,
-            tileSize = 16,
-            edgeSize = 16,
-            insets = { left = 4, right = 4, top = 4, bottom = 4 },
-        })
-        frame:SetBackdropColor(0, 0, 0, 0.9)
-    end
+local optionsFrame
+local fontRegistry = {}      -- { {fs=, size=, flags=}, ... } for live font swaps
+local pageCache = {}         -- ["section::tab"] = wrapper frame
+local sectionButtons = {}
+local tabPool = {}
+local tabButtons = {}
+local sectionByKey = {}
+local activeSection, activeTab, activeRefreshers, doSelectSection
 
-    local title = frame:CreateFontString(nil, "OVERLAY", "GameFontHighlightLarge")
-    title:SetPoint("TOP", 0, -14)
-    title:SetText("DropChanceTooltip Settings")
-
-    local itemSubtitle = frame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-    itemSubtitle:SetPoint("TOPLEFT", 16, -42)
-    itemSubtitle:SetText("Item tooltips: show rarities")
-
-    local itemFilterCheck = CreateFrame("CheckButton", nil, frame, "UICheckButtonTemplate")
-    itemFilterCheck:SetPoint("TOPLEFT", itemSubtitle, "BOTTOMLEFT", 0, -4)
-    setCheckButtonLabel(itemFilterCheck, "Enable rarity filter")
-    itemFilterCheck:SetScript("OnClick", function(self)
-        ensureSettings()
-        DropChanceTooltipDB.enableItemRarityFilter = self:GetChecked() and true or false
-    end)
-    frame.itemFilterCheck = itemFilterCheck
-
-    local mobSubtitle = frame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-    mobSubtitle:SetPoint("TOPLEFT", 152, -42)
-    mobSubtitle:SetText("Mob tooltips: show rarities")
-
-    local mobFilterCheck = CreateFrame("CheckButton", nil, frame, "UICheckButtonTemplate")
-    mobFilterCheck:SetPoint("TOPLEFT", mobSubtitle, "BOTTOMLEFT", 0, -4)
-    setCheckButtonLabel(mobFilterCheck, "Enable rarity filter")
-    mobFilterCheck:SetScript("OnClick", function(self)
-        ensureSettings()
-        DropChanceTooltipDB.enableMobRarityFilter = self:GetChecked() and true or false
-    end)
-    frame.mobFilterCheck = mobFilterCheck
-
-    local closeButton = CreateFrame("Button", nil, frame, "UIPanelCloseButton")
-    closeButton:SetPoint("TOPRIGHT", -4, -4)
-
-    frame.itemCheckboxes = {}
-    frame.mobCheckboxes = {}
-    local previousItem
-    local previousMob
-    for i = 1, #rarityOrder do
-        local rarity = rarityOrder[i]
-        local itemCheck = CreateFrame("CheckButton", nil, frame, "UICheckButtonTemplate")
-        itemCheck.rarity = rarity
-
-        local itemLabel = itemCheck:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-        itemLabel:SetPoint("LEFT", itemCheck, "RIGHT", 2, 1)
-        itemLabel:SetText(rarityLabels[rarity] or string.format("Rarity %d", rarity))
-        if not previousItem then
-            -- Indent the rarity rows so they read as children of the Enable toggle above.
-            itemCheck:SetPoint("TOPLEFT", itemFilterCheck, "BOTTOMLEFT", 16, -8)
-        else
-            itemCheck:SetPoint("TOPLEFT", previousItem, "BOTTOMLEFT", 0, -4)
-        end
-
-        itemCheck:SetScript("OnClick", function(self)
-            ensureSettings()
-            DropChanceTooltipDB.showItemByRarity[self.rarity] = self:GetChecked() and true or false
-            clearTooltipState(GameTooltip)
-            clearTooltipState(ItemRefTooltip)
-            if GameTooltip and GameTooltip:IsShown() then
-                GameTooltip:Hide()
-            end
-            if ItemRefTooltip and ItemRefTooltip:IsShown() then
-                ItemRefTooltip:Hide()
-            end
-        end)
-
-        frame.itemCheckboxes[rarity] = itemCheck
-        previousItem = itemCheck
-
-        local mobCheck = CreateFrame("CheckButton", nil, frame, "UICheckButtonTemplate")
-        mobCheck.rarity = rarity
-
-        local mobLabel = mobCheck:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-        mobLabel:SetPoint("LEFT", mobCheck, "RIGHT", 2, 1)
-        mobLabel:SetText(rarityLabels[rarity] or string.format("Rarity %d", rarity))
-        if not previousMob then
-            mobCheck:SetPoint("TOPLEFT", mobFilterCheck, "BOTTOMLEFT", 16, -8)
-        else
-            mobCheck:SetPoint("TOPLEFT", previousMob, "BOTTOMLEFT", 0, -4)
-        end
-
-        mobCheck:SetScript("OnClick", function(self)
-            ensureSettings()
-            DropChanceTooltipDB.showMobByRarity[self.rarity] = self:GetChecked() and true or false
-            clearTooltipState(GameTooltip)
-            clearTooltipState(ItemRefTooltip)
-            if GameTooltip and GameTooltip:IsShown() then
-                GameTooltip:Hide()
-            end
-            if ItemRefTooltip and ItemRefTooltip:IsShown() then
-                ItemRefTooltip:Hide()
-            end
-        end)
-
-        frame.mobCheckboxes[rarity] = mobCheck
-        previousMob = mobCheck
-    end
-
-    settingsWindow = frame
-    return frame
-end
-
-local function openSettingsWindow()
+-- ---- font helpers ---------------------------------------------------------------------------
+local function fontFile()
     ensureSettings()
-
-    local frame = createSettingsWindow()
-    for i = 1, #rarityOrder do
-        local rarity = rarityOrder[i]
-        local itemCheck = frame.itemCheckboxes and frame.itemCheckboxes[rarity]
-        if itemCheck then
-            itemCheck:SetChecked(DropChanceTooltipDB.showItemByRarity[rarity] == true)
-        end
-
-        local mobCheck = frame.mobCheckboxes and frame.mobCheckboxes[rarity]
-        if mobCheck then
-            mobCheck:SetChecked(DropChanceTooltipDB.showMobByRarity[rarity] == true)
-        end
-    end
-
-    if frame.itemFilterCheck then
-        frame.itemFilterCheck:SetChecked(DropChanceTooltipDB.enableItemRarityFilter == true)
-    end
-    if frame.mobFilterCheck then
-        frame.mobFilterCheck:SetChecked(DropChanceTooltipDB.enableMobRarityFilter == true)
-    end
-
-    frame:Show()
+    if DropChanceTooltipDB.useExpresswayFont then return FONT_EXPRESSWAY end
+    return FONT_DEFAULT
 end
 
-local function createSettingsPanel()
-    if settingsPanel then
-        return settingsPanel
+local function applyFont(fs, size, flags)
+    fs:SetFont(fontFile(), size, flags or "")
+    if not fs:GetFont() then fs:SetFont(FONT_DEFAULT, size, flags or "") end
+end
+
+local function refreshAllFonts()
+    for _, e in ipairs(fontRegistry) do applyFont(e.fs, e.size, e.flags) end
+end
+
+-- ---- primitives -----------------------------------------------------------------------------
+local function SolidTex(parent, layer, r, g, b, a)
+    local t = parent:CreateTexture(nil, layer or "BACKGROUND")
+    t:SetColorTexture(r, g, b, a or 1)
+    return t
+end
+
+local function MakeFont(parent, size, r, g, b, flags)
+    local fs = parent:CreateFontString(nil, "OVERLAY")
+    fontRegistry[#fontRegistry + 1] = { fs = fs, size = size, flags = flags }
+    applyFont(fs, size, flags)
+    fs:SetTextColor(r or 0.9, g or 0.9, b or 0.9, 1)
+    return fs
+end
+
+local function MakeBorder(parent, r, g, b, a)
+    r, g, b, a = r or 0, g or 0, b or 0, a or 1
+    local top = SolidTex(parent, "BORDER", r, g, b, a); top:SetPoint("TOPLEFT"); top:SetPoint("TOPRIGHT"); top:SetHeight(1)
+    local bot = SolidTex(parent, "BORDER", r, g, b, a); bot:SetPoint("BOTTOMLEFT"); bot:SetPoint("BOTTOMRIGHT"); bot:SetHeight(1)
+    local lft = SolidTex(parent, "BORDER", r, g, b, a); lft:SetPoint("TOPLEFT"); lft:SetPoint("BOTTOMLEFT"); lft:SetWidth(1)
+    local rgt = SolidTex(parent, "BORDER", r, g, b, a); rgt:SetPoint("TOPRIGHT"); rgt:SetPoint("BOTTOMRIGHT"); rgt:SetWidth(1)
+end
+
+-- Reflect a settings change immediately: drop cached tooltip state so the next hover re-renders.
+local function reflect()
+    clearTooltipState(GameTooltip)
+    clearTooltipState(ItemRefTooltip)
+    if GameTooltip and GameTooltip.IsShown and GameTooltip:IsShown() then GameTooltip:Hide() end
+end
+
+-- ---- widget factory (each returns its height; pages walk a y-cursor downward) ---------------
+local function makeSection(parent, text, y)
+    parent._rows = 0
+    local fs = MakeFont(parent, 11, 0.5, 0.5, 0.56)
+    fs:SetPoint("TOPLEFT", parent, "TOPLEFT", UI.PAD, y - 4)
+    fs:SetText(string.upper(text))
+    local line = SolidTex(parent, "ARTWORK", 1, 1, 1, 0.08)
+    line:SetPoint("TOPLEFT", fs, "BOTTOMLEFT", 0, -3)
+    line:SetPoint("RIGHT", parent, "RIGHT", -UI.PAD, 0)
+    line:SetHeight(1)
+    return 26
+end
+
+local function makeToggle(parent, text, y, get, set, tooltip, layout)
+    local rowIndex, x, wdt, ref
+    if layout then
+        rowIndex = layout.rowIndex or 0
+        x = layout.x or UI.PAD
+        wdt = layout.w
+        ref = layout.ref
+    else
+        rowIndex = parent._rows or 0
+        parent._rows = rowIndex + 1
+        x = UI.PAD
     end
+    local row = CreateFrame("Button", nil, parent)
+    row:SetPoint("TOPLEFT", parent, "TOPLEFT", x, y)
+    if wdt then row:SetWidth(wdt) else row:SetPoint("RIGHT", parent, "RIGHT", -UI.PAD, 0) end
+    row:SetHeight(UI.ROW_H)
+    local bg = SolidTex(row, "BACKGROUND", 1, 1, 1, (rowIndex % 2 == 0) and 0.03 or 0.06)
+    bg:SetAllPoints(row)
 
-    local panel = CreateFrame("Frame", "DropChanceTooltipInterfaceOptions")
-    panel.name = "DropChanceTooltip"
+    local label = MakeFont(row, 13, 0.88, 0.88, 0.9)
+    label:SetPoint("LEFT", 8, 0)
+    label:SetText(text)
 
-    local title = panel:CreateFontString(nil, "ARTWORK", "GameFontNormalLarge")
-    title:SetPoint("TOPLEFT", 16, -16)
-    title:SetText("DropChanceTooltip")
+    local track = CreateFrame("Frame", nil, row)
+    track:SetSize(38, 16)
+    track:SetPoint("RIGHT", -8, 0)
+    local trackTex = SolidTex(track, "ARTWORK", 0.28, 0.28, 0.32, 1)
+    trackTex:SetAllPoints(track)
+    local knob = track:CreateTexture(nil, "OVERLAY")
+    knob:SetSize(12, 12)
+    knob:SetColorTexture(0.9, 0.9, 0.9, 1)
 
-    local itemSubtitle = panel:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
-    itemSubtitle:SetPoint("TOPLEFT", title, "BOTTOMLEFT", 0, -8)
-    itemSubtitle:SetText("Item tooltips: show rarities")
-
-    local itemFilterCheck = CreateFrame("CheckButton", nil, panel, "InterfaceOptionsCheckButtonTemplate")
-    itemFilterCheck:SetPoint("TOPLEFT", itemSubtitle, "BOTTOMLEFT", 0, -2)
-    setCheckButtonLabel(itemFilterCheck, "Enable rarity filter")
-    itemFilterCheck:SetScript("OnClick", function(self)
-        ensureSettings()
-        DropChanceTooltipDB.enableItemRarityFilter = self:GetChecked() and true or false
-    end)
-    panel.itemFilterCheck = itemFilterCheck
-
-    local mobSubtitle = panel:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
-    mobSubtitle:SetPoint("TOPLEFT", title, "BOTTOMLEFT", 220, -8)
-    mobSubtitle:SetText("Mob tooltips: show rarities")
-
-    local mobFilterCheck = CreateFrame("CheckButton", nil, panel, "InterfaceOptionsCheckButtonTemplate")
-    mobFilterCheck:SetPoint("TOPLEFT", mobSubtitle, "BOTTOMLEFT", 0, -2)
-    setCheckButtonLabel(mobFilterCheck, "Enable rarity filter")
-    mobFilterCheck:SetScript("OnClick", function(self)
-        ensureSettings()
-        DropChanceTooltipDB.enableMobRarityFilter = self:GetChecked() and true or false
-    end)
-    panel.mobFilterCheck = mobFilterCheck
-
-    panel.itemCheckboxes = {}
-    panel.mobCheckboxes = {}
-    local previousItem
-    local previousMob
-    for i = 1, #rarityOrder do
-        local rarity = rarityOrder[i]
-        local itemCheck = CreateFrame("CheckButton", nil, panel, "InterfaceOptionsCheckButtonTemplate")
-        itemCheck.rarity = rarity
-        setCheckButtonLabel(itemCheck, rarityLabels[rarity] or string.format("Rarity %d", rarity))
-
-        if not previousItem then
-            -- Indent the rarity rows so they read as children of the Enable toggle above.
-            itemCheck:SetPoint("TOPLEFT", itemFilterCheck, "BOTTOMLEFT", 16, -8)
+    local ON_X, OFF_X = 24, 2
+    local cur = get() and ON_X or OFF_X
+    local dest = cur
+    local enabled = true
+    local function place() knob:ClearAllPoints(); knob:SetPoint("LEFT", track, "LEFT", cur, 0) end
+    local function applyVisual()
+        if enabled then
+            local on = (dest == ON_X)
+            label:SetTextColor(0.88, 0.88, 0.9)
+            trackTex:SetColorTexture(on and ACCENT[1] or 0.28, on and ACCENT[2] or 0.28, on and ACCENT[3] or 0.32, on and 0.9 or 1)
+            knob:SetAlpha(1)
         else
-            itemCheck:SetPoint("TOPLEFT", previousItem, "BOTTOMLEFT", 0, -4)
+            label:SetTextColor(0.42, 0.42, 0.45)
+            trackTex:SetColorTexture(0.2, 0.2, 0.22, 1)
+            knob:SetAlpha(0.35)
         end
+    end
+    local function setEnabled(on)
+        enabled = on and true or false
+        row:EnableMouse(enabled)
+        applyVisual()
+    end
+    place(); applyVisual()
 
-        itemCheck:SetScript("OnClick", function(self)
-            ensureSettings()
-            DropChanceTooltipDB.showItemByRarity[self.rarity] = self:GetChecked() and true or false
+    row:SetScript("OnUpdate", function(self, dt)
+        if cur ~= dest then
+            cur = cur + (dest - cur) * math.min(1, (dt or 0) * 14)
+            if math.abs(dest - cur) < 0.5 then cur = dest end
+            place()
+        end
+    end)
+    row:SetScript("OnClick", function()
+        if not enabled then return end
+        local on = not (dest == ON_X)
+        set(on and true or false)
+        dest = on and ON_X or OFF_X
+        applyVisual()
+    end)
+    if tooltip then
+        row:SetScript("OnEnter", function()
+            GameTooltip:SetOwner(row, "ANCHOR_RIGHT")
+            GameTooltip:SetText(tooltip, 1, 1, 1, 1, true)
+            GameTooltip:Show()
         end)
-
-        panel.itemCheckboxes[rarity] = itemCheck
-        previousItem = itemCheck
-
-        local mobCheck = CreateFrame("CheckButton", nil, panel, "InterfaceOptionsCheckButtonTemplate")
-        mobCheck.rarity = rarity
-        setCheckButtonLabel(mobCheck, rarityLabels[rarity] or string.format("Rarity %d", rarity))
-
-        if not previousMob then
-            mobCheck:SetPoint("TOPLEFT", mobFilterCheck, "BOTTOMLEFT", 16, -8)
-        else
-            mobCheck:SetPoint("TOPLEFT", previousMob, "BOTTOMLEFT", 0, -4)
-        end
-
-        mobCheck:SetScript("OnClick", function(self)
-            ensureSettings()
-            DropChanceTooltipDB.showMobByRarity[self.rarity] = self:GetChecked() and true or false
-        end)
-
-        panel.mobCheckboxes[rarity] = mobCheck
-        previousMob = mobCheck
+        row:SetScript("OnLeave", function() GameTooltip:Hide() end)
     end
-
-    -- ---- Item tooltip: owned counts (self + alts), below the item-rarity column -----------------
-    local countSubtitle = panel:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
-    countSubtitle:SetPoint("TOPLEFT", previousItem, "BOTTOMLEFT", -16, -14)
-    countSubtitle:SetText("Item tooltip: owned counts")
-
-    panel.countChecks = {}
-    local countSpec = {
-        { key = "showSelfBags", label = "Your bags" },
-        { key = "showSelfBank", label = "Your bank" },
-        { key = "showAltsBags", label = "Alts' bags" },
-        { key = "showAltsBank", label = "Alts' bank" },
-        { key = "countConsolidated", label = "Consolidated total (n bags, n bank)" },
-        { key = "countIncludeAlts", label = "Include alts in total", indent = true },
-    }
-    -- "Include alts in total" only applies to the consolidated total, so it's disabled unless
-    -- Consolidated is checked.
-    local function syncIncludeAlts()
-        local ia = panel.countChecks.countIncludeAlts
-        if ia then ia:SetEnabled(DropChanceTooltipDB.countConsolidated == true) end
+    if ref then ref.frame = row; ref.setEnabled = setEnabled end
+    if activeRefreshers then
+        activeRefreshers[#activeRefreshers + 1] = function()
+            local on = get() and true or false
+            dest = on and ON_X or OFF_X; cur = dest; place(); applyVisual()
+        end
     end
-    panel.syncIncludeAlts = syncIncludeAlts
+    return UI.ROW_H
+end
 
-    local prevCount
-    for _, spec in ipairs(countSpec) do
-        local check = CreateFrame("CheckButton", nil, panel, "InterfaceOptionsCheckButtonTemplate")
-        check.dbKey = spec.key
-        setCheckButtonLabel(check, spec.label)
-        if not prevCount then
-            check:SetPoint("TOPLEFT", countSubtitle, "BOTTOMLEFT", 16, -6)
-        else
-            check:SetPoint("TOPLEFT", prevCount, "BOTTOMLEFT", spec.indent and 12 or 0, -4)
-        end
-        check:SetScript("OnClick", function(self)
-            ensureSettings()
-            DropChanceTooltipDB[self.dbKey] = self:GetChecked() and true or false
-            if self.dbKey == "countConsolidated" then syncIncludeAlts() end
-        end)
-        panel.countChecks[spec.key] = check
-        prevCount = check
+local function makeSlider(parent, text, y, minV, maxV, step, get, set, fmt)
+    local H = 40
+    local c = CreateFrame("Frame", nil, parent)
+    c:SetPoint("TOPLEFT", parent, "TOPLEFT", UI.PAD, y)
+    c:SetPoint("RIGHT", parent, "RIGHT", -UI.PAD, 0)
+    c:SetHeight(H)
+    local label = MakeFont(c, 13, 0.88, 0.88, 0.9); label:SetPoint("TOPLEFT", 8, -2); label:SetText(text)
+    local valfs = MakeFont(c, 13, ACCENT[1], ACCENT[2], ACCENT[3]); valfs:SetPoint("TOPRIGHT", -8, -2)
+
+    local track = CreateFrame("Frame", nil, c)
+    track:SetPoint("TOPLEFT", label, "BOTTOMLEFT", 0, -8)
+    track:SetPoint("RIGHT", c, "RIGHT", -10, 0)
+    track:SetHeight(5)
+    track:EnableMouse(true)
+    local tbg = SolidTex(track, "ARTWORK", 0.24, 0.24, 0.28, 1); tbg:SetAllPoints(track)
+    local fill = SolidTex(track, "OVERLAY", ACCENT[1], ACCENT[2], ACCENT[3], 0.85)
+    fill:SetPoint("TOPLEFT"); fill:SetPoint("BOTTOMLEFT"); fill:SetWidth(1)
+    local thumb = CreateFrame("Button", nil, track); thumb:SetSize(12, 12)
+    local thtex = SolidTex(thumb, "OVERLAY", 0.92, 0.92, 0.92, 1); thtex:SetAllPoints(thumb)
+
+    local function clamp(v)
+        v = math.max(minV, math.min(maxV, v))
+        if step and step > 0 then v = math.floor((v - minV) / step + 0.5) * step + minV end
+        return v
     end
-    syncIncludeAlts()
-
-    -- ---- Mob tooltip: "various X" groups + drop-chance floor (third column) ------------------
-    local variousSubtitle = panel:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
-    variousSubtitle:SetPoint("TOPLEFT", title, "BOTTOMLEFT", 400, -8)
-    variousSubtitle:SetText("Mob tooltips: groups")
-
-    local questAlwaysCheck = CreateFrame("CheckButton", nil, panel, "InterfaceOptionsCheckButtonTemplate")
-    questAlwaysCheck:SetPoint("TOPLEFT", variousSubtitle, "BOTTOMLEFT", 0, -6)
-    setCheckButtonLabel(questAlwaysCheck, "Always show quest items")
-    questAlwaysCheck:SetScript("OnClick", function(self)
-        ensureSettings()
-        DropChanceTooltipDB.alwaysShowQuestItems = self:GetChecked() and true or false
-    end)
-    panel.questAlwaysCheck = questAlwaysCheck
-
-    local expandAllCheck = CreateFrame("CheckButton", nil, panel, "InterfaceOptionsCheckButtonTemplate")
-    expandAllCheck:SetPoint("TOPLEFT", questAlwaysCheck, "BOTTOMLEFT", 0, -6)
-    setCheckButtonLabel(expandAllCheck, "Expand all groups")
-    expandAllCheck:SetScript("OnClick", function(self)
-        ensureSettings()
-        DropChanceTooltipDB.expandAllVarious = self:GetChecked() and true or false
-    end)
-    panel.expandAllCheck = expandAllCheck
-
-    -- Per-group: Show (off = hidden) + Expand (on = list individually, off = collapse to one line).
-    -- Indented under Expand-all to read as its detail rows.
-    panel.groupShow = {}
-    panel.groupExpand = {}
-    local prevGroup
-    for _, key in ipairs(GROUP_ORDER) do
-        local shortLabel = GROUP_META[key].label:gsub("^Various ", "")
-        local showCheck = CreateFrame("CheckButton", nil, panel, "InterfaceOptionsCheckButtonTemplate")
-        showCheck.groupKey = key
-        setCheckButtonLabel(showCheck, shortLabel)
-        if not prevGroup then
-            showCheck:SetPoint("TOPLEFT", expandAllCheck, "BOTTOMLEFT", 16, -6)
-        else
-            showCheck:SetPoint("TOPLEFT", prevGroup, "BOTTOMLEFT", 0, -4)
-        end
-
-        local expandCheck = CreateFrame("CheckButton", nil, panel, "InterfaceOptionsCheckButtonTemplate")
-        expandCheck.groupKey = key
-        setCheckButtonLabel(expandCheck, "exp")
-        expandCheck:SetPoint("LEFT", showCheck, "LEFT", 140, 0)
-
-        local function writeMode()
-            ensureSettings()
-            if not showCheck:GetChecked() then
-                DropChanceTooltipDB.variousMode[key] = "hidden"
-            elseif expandCheck:GetChecked() then
-                DropChanceTooltipDB.variousMode[key] = "expand"
-            else
-                DropChanceTooltipDB.variousMode[key] = "collapse"
-            end
-            expandCheck:SetEnabled(showCheck:GetChecked())
-        end
-        showCheck:SetScript("OnClick", writeMode)
-        expandCheck:SetScript("OnClick", writeMode)
-
-        panel.groupShow[key] = showCheck
-        panel.groupExpand[key] = expandCheck
-        prevGroup = showCheck
+    local value = clamp(get() or minV)
+    local function layout()
+        local w = track:GetWidth() or 1
+        local frac = (maxV > minV) and (value - minV) / (maxV - minV) or 0
+        thumb:ClearAllPoints(); thumb:SetPoint("CENTER", track, "LEFT", frac * w, 0)
+        fill:SetWidth(math.max(1, frac * w))
+        valfs:SetText(fmt and fmt(value) or tostring(value))
     end
+    local function fromCursor()
+        local x = GetCursorPosition() / (track:GetEffectiveScale() or 1)
+        local left = track:GetLeft() or 0
+        local w = track:GetWidth() or 1
+        return clamp(minV + ((x - left) / w) * (maxV - minV))
+    end
+    local dragging = false
+    thumb:SetScript("OnMouseDown", function() dragging = true end)
+    thumb:SetScript("OnMouseUp", function() dragging = false; value = fromCursor(); layout(); set(value) end)
+    thumb:SetScript("OnUpdate", function() if dragging then value = fromCursor(); layout(); set(value) end end)
+    track:SetScript("OnMouseDown", function() value = fromCursor(); layout(); set(value) end)
+    track:SetScript("OnSizeChanged", layout)
+    if activeRefreshers then
+        activeRefreshers[#activeRefreshers + 1] = function() value = clamp(get() or minV); layout() end
+    end
+    if C_Timer and C_Timer.After then C_Timer.After(0, layout) end
+    return H
+end
 
-    -- Drop-chance floor slider at the BOTTOM of the column (below the group rows).
-    local threshold = CreateFrame("Slider", "DCTThresholdSlider", panel, "OptionsSliderTemplate")
-    threshold:SetPoint("TOPLEFT", prevGroup, "BOTTOMLEFT", -16, -28)
-    threshold:SetWidth(180)
-    threshold:SetMinMaxValues(0, 5)
-    threshold:SetValueStep(0.25)
-    if threshold.SetObeyStepOnDrag then threshold:SetObeyStepOnDrag(true) end
-    _G[threshold:GetName() .. "Low"]:SetText("0%")
-    _G[threshold:GetName() .. "High"]:SetText("5%")
-    threshold:SetScript("OnValueChanged", function(self, value)
-        ensureSettings()
-        value = math.floor(value * 4 + 0.5) / 4
-        DropChanceTooltipDB.minDropChancePercent = value
-        _G[self:GetName() .. "Text"]:SetText(string.format("Min drop chance: %.2f%%", value))
-    end)
-    panel.thresholdSlider = threshold
+local function makeButton(parent, text, y, onClick)
+    local b = CreateFrame("Button", nil, parent)
+    b:SetPoint("TOPLEFT", parent, "TOPLEFT", UI.PAD, y)
+    b:SetSize(220, 26)
+    local bg = SolidTex(b, "ARTWORK", 0.16, 0.16, 0.19, 1); bg:SetAllPoints(b)
+    MakeBorder(b, 0, 0, 0, 0.8)
+    local fs = MakeFont(b, 13, 0.9, 0.9, 0.9); fs:SetPoint("CENTER"); fs:SetText(text)
+    b:SetScript("OnEnter", function() bg:SetColorTexture(ACCENT[1] * 0.35, ACCENT[2] * 0.35, ACCENT[3] * 0.35, 1) end)
+    b:SetScript("OnLeave", function() bg:SetColorTexture(0.16, 0.16, 0.19, 1) end)
+    b:SetScript("OnClick", onClick)
+    return 34
+end
 
-    local function refreshSettingsPanelState()
-        ensureSettings()
-        for i = 1, #rarityOrder do
-            local rarity = rarityOrder[i]
-            local itemCheck = panel.itemCheckboxes and panel.itemCheckboxes[rarity]
-            if itemCheck then
-                itemCheck:SetChecked(DropChanceTooltipDB.showItemByRarity[rarity] == true)
-            end
+local function resetAll()
+    if type(DropChanceTooltipDB) == "table" then
+        for k in pairs(DropChanceTooltipDB) do DropChanceTooltipDB[k] = nil end
+    end
+    ensureSettings()
+    refreshAllFonts()
+    reflect()
+    if doSelectSection and activeSection then doSelectSection(activeSection) end
+end
 
-            local mobCheck = panel.mobCheckboxes and panel.mobCheckboxes[rarity]
-            if mobCheck then
-                mobCheck:SetChecked(DropChanceTooltipDB.showMobByRarity[rarity] == true)
-            end
-        end
+-- Lay a list of simple {text,get,set} toggles into two columns; returns the new y-cursor.
+local function twoColumn(parent, y, items)
+    local W0 = parent:GetWidth()
+    if not W0 or W0 < 50 then W0 = UI.W - UI.SIDEBAR_W - 20 end
+    local gap = 12
+    local colW = (W0 - UI.PAD * 2 - gap) / 2
+    local rightX = UI.PAD + colW + gap
+    local ri = 0
+    local i = 1
+    while i <= #items do
+        local a = items[i]
+        makeToggle(parent, a.text, y, a.get, a.set, a.tooltip, { x = UI.PAD, w = colW, rowIndex = ri, ref = a.ref })
+        local b = items[i + 1]
+        if b then makeToggle(parent, b.text, y, b.get, b.set, b.tooltip, { x = rightX, w = colW, rowIndex = ri, ref = b.ref }) end
+        y = y - UI.ROW_H
+        ri = ri + 1
+        i = i + 2
+    end
+    return y
+end
 
-        if panel.itemFilterCheck then
-            panel.itemFilterCheck:SetChecked(DropChanceTooltipDB.enableItemRarityFilter == true)
-        end
-        if panel.mobFilterCheck then
-            panel.mobFilterCheck:SetChecked(DropChanceTooltipDB.enableMobRarityFilter == true)
-        end
+-- ---- page builders (build(tab, wrapper) -> total height) ------------------------------------
+local function buildGeneral(_, w)
+    local y = -UI.PAD
+    y = y - makeSection(w, "Drop tooltips", y)
+    y = y - makeToggle(w, "Enable drop tooltips", y,
+        function() return DropChanceTooltipDB.enabled ~= false end,
+        function(v) DropChanceTooltip_Toggle(v and true or false) end,
+        "Master on/off for all DropChanceTooltip additions.")
+    y = y - makeSection(w, "Material aggregation", y)
+    y = y - makeToggle(w, "Aggregate material sources", y,
+        function() return DropChanceTooltipDB.enableMaterialAggregation end,
+        function(v) DropChanceTooltipDB.enableMaterialAggregation = v; reflect() end,
+        "Show a summarized source (level range / zones / recipe) for materials instead of every NPC.")
+    y = y - makeToggle(w, "Use trash mobs only for level ranges", y,
+        function() return DropChanceTooltipDB.materialTrashOnly end,
+        function(v) DropChanceTooltipDB.materialTrashOnly = v; reflect() end)
+    y = y - makeSlider(w, "Minimum drop % to count toward a range", y, 0, 100, 1,
+        function() return DropChanceTooltipDB.materialMinPercent end,
+        function(v) DropChanceTooltipDB.materialMinPercent = v; reflect() end,
+        function(v) return string.format("%d%%", v) end)
+    y = y - makeSection(w, "Appearance", y)
+    y = y - makeToggle(w, "Use Expressway font (EllesmereUI look)", y,
+        function() return DropChanceTooltipDB.useExpresswayFont end,
+        function(v) DropChanceTooltipDB.useExpresswayFont = v; refreshAllFonts() end)
+    return -y + UI.PAD
+end
 
-        if panel.thresholdSlider then
-            local v = tonumber(DropChanceTooltipDB.minDropChancePercent) or 1.0
-            panel.thresholdSlider:SetValue(v)
-            _G[panel.thresholdSlider:GetName() .. "Text"]:SetText(string.format("Min drop chance: %.2f%%", v))
+local function buildItem(tab, w)
+    local y = -UI.PAD
+    if tab == "Rarity" then
+        y = y - makeSection(w, "Item rarity filter", y)
+        y = y - makeToggle(w, "Enable rarity filter", y,
+            function() return DropChanceTooltipDB.enableItemRarityFilter end,
+            function(v) DropChanceTooltipDB.enableItemRarityFilter = v; reflect() end)
+        local items = {}
+        for _, r in ipairs(rarityOrder) do
+            local rr = r
+            items[#items + 1] = {
+                text = rarityLabels[rr] or ("Rarity " .. rr),
+                get = function() return DropChanceTooltipDB.showItemByRarity[rr] == true end,
+                set = function(v) DropChanceTooltipDB.showItemByRarity[rr] = v; reflect() end,
+            }
         end
-        if panel.expandAllCheck then
-            panel.expandAllCheck:SetChecked(DropChanceTooltipDB.expandAllVarious == true)
+        y = twoColumn(w, y, items)
+    elseif tab == "Sources" then
+        y = y - makeSection(w, "Sources shown per item", y)
+        y = y - makeSlider(w, "Default count", y, 1, 30, 1,
+            function() return DropChanceTooltipDB.sourceCountDefault end,
+            function(v) DropChanceTooltipDB.sourceCountDefault = v; reflect() end,
+            function(v) return string.format("%d", v) end)
+        y = y - makeSlider(w, "Expanded cap (Shift held)", y, 1, 60, 1,
+            function() return DropChanceTooltipDB.sourceExpandedCap end,
+            function(v) DropChanceTooltipDB.sourceExpandedCap = v; reflect() end,
+            function(v) return string.format("%d", v) end)
+    else -- Owned Counts
+        y = y - makeSection(w, "Owned counts", y)
+        local consRef, incRef = {}, {}
+        y = twoColumn(w, y, {
+            { text = "Your bags",  get = function() return DropChanceTooltipDB.showSelfBags end,
+              set = function(v) DropChanceTooltipDB.showSelfBags = v; reflect() end },
+            { text = "Your bank",  get = function() return DropChanceTooltipDB.showSelfBank end,
+              set = function(v) DropChanceTooltipDB.showSelfBank = v; reflect() end },
+            { text = "Alts' bags", get = function() return DropChanceTooltipDB.showAltsBags end,
+              set = function(v) DropChanceTooltipDB.showAltsBags = v; reflect() end },
+            { text = "Alts' bank", get = function() return DropChanceTooltipDB.showAltsBank end,
+              set = function(v) DropChanceTooltipDB.showAltsBank = v; reflect() end },
+            { text = "Consolidated total", ref = consRef, get = function() return DropChanceTooltipDB.countConsolidated end,
+              set = function(v) DropChanceTooltipDB.countConsolidated = v; reflect(); if incRef.setEnabled then incRef.setEnabled(v) end end },
+            { text = "Include alts in total", ref = incRef, get = function() return DropChanceTooltipDB.countIncludeAlts end,
+              set = function(v) DropChanceTooltipDB.countIncludeAlts = v; reflect() end },
+        })
+        local function syncInc() if incRef.setEnabled then incRef.setEnabled(DropChanceTooltipDB.countConsolidated == true) end end
+        syncInc()
+        if activeRefreshers then activeRefreshers[#activeRefreshers + 1] = syncInc end
+    end
+    return -y + UI.PAD
+end
+
+local function buildMob(tab, w)
+    local y = -UI.PAD
+    if tab == "Rarity" then
+        y = y - makeSection(w, "Mob rarity filter", y)
+        y = y - makeToggle(w, "Enable rarity filter", y,
+            function() return DropChanceTooltipDB.enableMobRarityFilter end,
+            function(v) DropChanceTooltipDB.enableMobRarityFilter = v; reflect() end)
+        local items = {}
+        for _, r in ipairs(rarityOrder) do
+            local rr = r
+            items[#items + 1] = {
+                text = rarityLabels[rr] or ("Rarity " .. rr),
+                get = function() return DropChanceTooltipDB.showMobByRarity[rr] == true end,
+                set = function(v) DropChanceTooltipDB.showMobByRarity[rr] = v; reflect() end,
+            }
         end
-        if panel.questAlwaysCheck then
-            panel.questAlwaysCheck:SetChecked(DropChanceTooltipDB.alwaysShowQuestItems == true)
-        end
-        if panel.countChecks then
-            for key, check in pairs(panel.countChecks) do
-                check:SetChecked(DropChanceTooltipDB[key] == true)
-            end
-            if panel.syncIncludeAlts then panel.syncIncludeAlts() end
-        end
+        y = twoColumn(w, y, items)
+    elseif tab == "Groups" then
+        y = y - makeSection(w, "Collapsible groups", y)
+        y = y - makeToggle(w, "Expand all groups", y,
+            function() return DropChanceTooltipDB.expandAllVarious end,
+            function(v) DropChanceTooltipDB.expandAllVarious = v; reflect() end)
+        local W0 = w:GetWidth()
+        if not W0 or W0 < 50 then W0 = UI.W - UI.SIDEBAR_W - 20 end
+        local gap = 12
+        local colW = (W0 - UI.PAD * 2 - gap) / 2
+        local rightX = UI.PAD + colW + gap
+        local ri = 0
         for _, key in ipairs(GROUP_ORDER) do
-            local mode = DropChanceTooltipDB.variousMode[key] or "collapse"
-            local showCheck = panel.groupShow[key]
-            local expandCheck = panel.groupExpand[key]
-            if showCheck then showCheck:SetChecked(mode ~= "hidden") end
-            if expandCheck then
-                expandCheck:SetChecked(mode == "expand")
-                expandCheck:SetEnabled(mode ~= "hidden")
+            local gk = key
+            local short = GROUP_META[gk].label:gsub("^Various ", "")
+            local expandRef = {}
+            local function syncExpand()
+                if expandRef.setEnabled then
+                    expandRef.setEnabled((DropChanceTooltipDB.variousMode[gk] or "collapse") ~= "hidden")
+                end
             end
+            makeToggle(w, "Show " .. short, y,
+                function() return (DropChanceTooltipDB.variousMode[gk] or "collapse") ~= "hidden" end,
+                function(v)
+                    if not v then
+                        DropChanceTooltipDB.variousMode[gk] = "hidden"
+                    elseif DropChanceTooltipDB.variousMode[gk] == "hidden" then
+                        DropChanceTooltipDB.variousMode[gk] = "collapse"
+                    end
+                    reflect()
+                    syncExpand()
+                end, nil, { x = UI.PAD, w = colW, rowIndex = ri })
+            makeToggle(w, "Expand", y,
+                function() return DropChanceTooltipDB.variousMode[gk] == "expand" end,
+                function(v)
+                    if DropChanceTooltipDB.variousMode[gk] ~= "hidden" then
+                        DropChanceTooltipDB.variousMode[gk] = v and "expand" or "collapse"
+                    end
+                    reflect()
+                end, nil, { x = rightX, w = colW, rowIndex = ri, ref = expandRef })
+            syncExpand()
+            if activeRefreshers then activeRefreshers[#activeRefreshers + 1] = syncExpand end
+            y = y - UI.ROW_H
+            ri = ri + 1
+        end
+    elseif tab == "Quest" then
+        y = y - makeSection(w, "Quest items", y)
+        y = y - makeToggle(w, "Always show quest items", y,
+            function() return DropChanceTooltipDB.alwaysShowQuestItems end,
+            function(v) DropChanceTooltipDB.alwaysShowQuestItems = v; reflect() end)
+        y = y - makeSlider(w, "Minimum quest drop %", y, 0, 5, 0.25,
+            function() return DropChanceTooltipDB.minQuestChancePercent end,
+            function(v) DropChanceTooltipDB.minQuestChancePercent = v; reflect() end,
+            function(v) return string.format("%.2f%%", v) end)
+    else -- Thresholds
+        y = y - makeSection(w, "Drop thresholds", y)
+        y = y - makeSlider(w, "Minimum drop %", y, 0, 5, 0.25,
+            function() return DropChanceTooltipDB.minDropChancePercent end,
+            function(v) DropChanceTooltipDB.minDropChancePercent = v; reflect() end,
+            function(v) return string.format("%.2f%%", v) end)
+        y = y - makeSlider(w, "Drops shown", y, 1, 25, 1,
+            function() return DropChanceTooltipDB.mobDropCount end,
+            function(v) DropChanceTooltipDB.mobDropCount = v; reflect() end,
+            function(v) return string.format("%d", v) end)
+        y = y - makeSlider(w, "Expanded cap (Shift held)", y, 1, 50, 1,
+            function() return DropChanceTooltipDB.mobDropExpandedCap end,
+            function(v) DropChanceTooltipDB.mobDropExpandedCap = v; reflect() end,
+            function(v) return string.format("%d", v) end)
+    end
+    return -y + UI.PAD
+end
+
+local function buildProfessions(tab, w)
+    local map = { Mining = "mining", Herbalism = "herbalism", Skinning = "skinning" }
+    local key = map[tab] or "mining"
+    local y = -UI.PAD
+    y = y - makeSection(w, tab, y)
+    y = y - makeToggle(w, "Show " .. tab .. " requirements", y,
+        function() return DropChanceTooltipDB.professions[key].enabled end,
+        function(v)
+            DropChanceTooltipDB.professions[key].enabled = v
+            if GameTooltip then GameTooltip.__dctNodeSig = nil; GameTooltip.__dctSkinSig = nil end
+        end,
+        "Show " .. tab .. " skill requirements on gather nodes / beasts.")
+    y = y - makeToggle(w, "Show even without the profession", y,
+        function() return DropChanceTooltipDB.professions[key].showWithoutProfession end,
+        function(v)
+            DropChanceTooltipDB.professions[key].showWithoutProfession = v
+            if GameTooltip then GameTooltip.__dctNodeSig = nil; GameTooltip.__dctSkinSig = nil end
+        end,
+        "Show the requirement even on characters that lack " .. tab .. ".")
+    return -y + UI.PAD
+end
+
+local function buildAdvanced(_, w)
+    local y = -UI.PAD
+    y = y - makeSection(w, "Data & diagnostics", y)
+    y = y - makeButton(w, "Export data gaps", y, function() SlashCmdList.DROPCHANCETOOLTIP("gaps export") end)
+    y = y - makeButton(w, "Run diagnostics", y, function() SlashCmdList.DROPCHANCETOOLTIP("diag") end)
+    y = y - makeButton(w, "Character name probe", y, function() SlashCmdList.DROPCHANCETOOLTIP("whoami") end)
+    y = y - makeButton(w, "Toggle debug chat", y, function() SlashCmdList.DROPCHANCETOOLTIP("debugchat") end)
+    y = y - makeSection(w, "Reset", y)
+    y = y - makeButton(w, "Reset all settings to defaults", y, resetAll)
+    return -y + UI.PAD
+end
+
+local SECTIONS = {
+    { key = "general", title = "General",      desc = "Master toggle, material aggregation, and appearance.", build = buildGeneral },
+    { key = "item",    title = "Item Tooltips", desc = "Drop sources, source counts, and owned-item counts.", tabs = { "Rarity", "Sources", "Owned Counts" }, build = buildItem },
+    { key = "mob",     title = "Mob Tooltips",  desc = "Rarity, collapsible groups, quest items, thresholds.", tabs = { "Rarity", "Groups", "Quest", "Thresholds" }, build = buildMob },
+    { key = "prof",    title = "Professions",   desc = "Show gather-node / skinning skill requirements, per profession.", tabs = { "Mining", "Herbalism", "Skinning" }, build = buildProfessions },
+    { key = "adv",     title = "Advanced",      desc = "Data-gap export, diagnostics, and reset.", build = buildAdvanced },
+}
+for _, sec in ipairs(SECTIONS) do sectionByKey[sec.key] = sec end
+
+-- ---- window shell ---------------------------------------------------------------------------
+local function createOptionsWindow()
+    if optionsFrame then return optionsFrame end
+
+    local f = CreateFrame("Frame", "DropChanceTooltipOptionsFrame", UIParent)
+    f:SetSize(UI.W, UI.H)
+    f:SetPoint("CENTER")
+    f:SetFrameStrata("DIALOG")
+    f:EnableMouse(true)
+    f:SetMovable(true)
+    f:RegisterForDrag("LeftButton")
+    f:SetScript("OnDragStart", f.StartMoving)
+    f:SetScript("OnDragStop", f.StopMovingOrSizing)
+    f:Hide()
+    local bg = SolidTex(f, "BACKGROUND", 0.06, 0.06, 0.07, 0.97); bg:SetAllPoints(f)
+    MakeBorder(f, 0, 0, 0, 1)
+    if UISpecialFrames then tinsert(UISpecialFrames, "DropChanceTooltipOptionsFrame") end
+
+    local titleFs = MakeFont(f, 16, ACCENT[1], ACCENT[2], ACCENT[3]); titleFs:SetPoint("TOPLEFT", 14, -10); titleFs:SetText("DropChanceTooltip")
+    local close = CreateFrame("Button", nil, f)
+    close:SetSize(22, 22)
+    close:SetPoint("TOPRIGHT", -8, -7)
+    local closeX = MakeFont(close, 17, 0.75, 0.28, 0.28); closeX:SetPoint("CENTER"); closeX:SetText("X")
+    close:SetScript("OnEnter", function() closeX:SetTextColor(1, 0.2, 0.2) end)
+    close:SetScript("OnLeave", function() closeX:SetTextColor(0.75, 0.28, 0.28) end)
+    close:SetScript("OnClick", function() f:Hide() end)
+    local titleLine = SolidTex(f, "ARTWORK", 1, 1, 1, 0.08); titleLine:SetPoint("TOPLEFT", 0, -34); titleLine:SetPoint("TOPRIGHT", 0, -34); titleLine:SetHeight(1)
+
+    local sidebar = CreateFrame("Frame", nil, f)
+    sidebar:SetPoint("TOPLEFT", 0, -34); sidebar:SetPoint("BOTTOMLEFT", 0, 0); sidebar:SetWidth(UI.SIDEBAR_W)
+    local sbBg = SolidTex(sidebar, "BACKGROUND", 1, 1, 1, 0.02); sbBg:SetAllPoints(sidebar)
+    local sbLine = SolidTex(sidebar, "ARTWORK", 1, 1, 1, 0.08); sbLine:SetPoint("TOPRIGHT"); sbLine:SetPoint("BOTTOMRIGHT"); sbLine:SetWidth(1)
+
+    local right = CreateFrame("Frame", nil, f)
+    right:SetPoint("TOPLEFT", sidebar, "TOPRIGHT", 0, 0); right:SetPoint("BOTTOMRIGHT", 0, 0)
+    local headerFs = MakeFont(right, 18, 0.95, 0.95, 0.97); headerFs:SetPoint("TOPLEFT", UI.PAD, -12)
+    local descFs = MakeFont(right, 12, 0.6, 0.6, 0.64)
+    descFs:SetPoint("TOPLEFT", headerFs, "BOTTOMLEFT", 0, -4); descFs:SetPoint("RIGHT", right, "RIGHT", -UI.PAD, 0); descFs:SetJustifyH("LEFT")
+
+    local tabBar = CreateFrame("Frame", nil, right)
+    tabBar:SetPoint("TOPLEFT", 0, -UI.HEADER_H); tabBar:SetPoint("TOPRIGHT", 0, -UI.HEADER_H); tabBar:SetHeight(UI.TABBAR_H)
+    local tabLine = SolidTex(tabBar, "ARTWORK", 1, 1, 1, 0.08); tabLine:SetPoint("BOTTOMLEFT"); tabLine:SetPoint("BOTTOMRIGHT"); tabLine:SetHeight(1)
+
+    local scrollFrame = CreateFrame("ScrollFrame", nil, right)
+    scrollFrame:SetPoint("TOPLEFT", tabBar, "BOTTOMLEFT", 0, -4)
+    scrollFrame:SetPoint("BOTTOMRIGHT", right, "BOTTOMRIGHT", -6, 8)
+    local scrollChild = CreateFrame("Frame", nil, scrollFrame)
+    scrollChild:SetSize(1, 1)
+    scrollFrame:SetScrollChild(scrollChild)
+    scrollFrame:EnableMouseWheel(true)
+    scrollFrame:SetScript("OnMouseWheel", function(self, delta)
+        local maxScroll = math.max(0, (scrollChild:GetHeight() or 0) - (self:GetHeight() or 0))
+        local nv = math.min(maxScroll, math.max(0, self:GetVerticalScroll() - (delta or 0) * 28))
+        self:SetVerticalScroll(nv)
+    end)
+
+    local function getTab(i)
+        local t = tabPool[i]
+        if not t then
+            t = CreateFrame("Button", nil, tabBar)
+            t:SetHeight(UI.TABBAR_H)
+            t._label = MakeFont(t, 13, 0.7, 0.7, 0.72); t._label:SetPoint("CENTER", 0, 0)
+            t._underline = SolidTex(t, "OVERLAY", ACCENT[1], ACCENT[2], ACCENT[3], 1)
+            t._underline:SetPoint("BOTTOMLEFT", 6, 0); t._underline:SetPoint("BOTTOMRIGHT", -6, 0); t._underline:SetHeight(2)
+            tabPool[i] = t
+        end
+        return t
+    end
+
+    local function runList(list) if list then for _, fn in ipairs(list) do fn() end end end
+
+    local function selectTab(name)
+        activeTab = name
+        for _, t in ipairs(tabButtons) do
+            local on = (t._name == name)
+            t._label:SetTextColor(on and 1 or 0.7, on and 1 or 0.7, on and 1 or 0.72)
+            if on then t._underline:Show() else t._underline:Hide() end
+        end
+        for _, wpr in pairs(pageCache) do wpr:Hide() end
+        local ckey = activeSection .. "::" .. name
+        local wrapper = pageCache[ckey]
+        local contentW = scrollFrame:GetWidth()
+        if not contentW or contentW < 1 then contentW = UI.W - UI.SIDEBAR_W - 12 end
+        if not wrapper then
+            wrapper = CreateFrame("Frame", nil, scrollChild)
+            wrapper:SetPoint("TOPLEFT", scrollChild, "TOPLEFT", 0, 0)
+            wrapper:SetWidth(contentW)
+            wrapper._refreshers = {}
+            pageCache[ckey] = wrapper
+            activeRefreshers = wrapper._refreshers
+            local h = sectionByKey[activeSection].build(name, wrapper) or 20
+            wrapper:SetHeight(h)
+            activeRefreshers = nil
+        end
+        wrapper:SetWidth(contentW)
+        wrapper:Show()
+        scrollChild:SetSize(contentW, wrapper:GetHeight())
+        scrollFrame:SetVerticalScroll(0)
+        runList(wrapper._refreshers)
+    end
+
+    local function selectSection(key)
+        activeSection = key
+        local section = sectionByKey[key]
+        if not section then return end
+        headerFs:SetText(section.title)
+        descFs:SetText(section.desc or "")
+        for k, b in pairs(sectionButtons) do
+            local on = (k == key)
+            if on then b._accent:Show() else b._accent:Hide() end
+            b._label:SetTextColor(on and 1 or 0.72, on and 1 or 0.72, on and 1 or 0.75)
+            if on then b._hl:Show() else b._hl:Hide() end
+        end
+        for _, t in ipairs(tabPool) do t:Hide() end
+        wipe(tabButtons)
+        local tabs = section.tabs
+        if tabs and #tabs > 0 then
+            local x = UI.PAD
+            for i, tabName in ipairs(tabs) do
+                local t = getTab(i)
+                t._name = tabName
+                t._label:SetText(tabName)
+                t:SetWidth((t._label:GetStringWidth() or 40) + 22)
+                t:ClearAllPoints(); t:SetPoint("BOTTOMLEFT", tabBar, "BOTTOMLEFT", x, 0)
+                x = x + t:GetWidth() + 8
+                t:SetScript("OnClick", function() selectTab(tabName) end)
+                t:Show()
+                tabButtons[i] = t
+            end
+            selectTab(tabs[1])
+        else
+            selectTab("_")
         end
     end
+    doSelectSection = selectSection
 
-    panel.refresh = refreshSettingsPanelState
-    panel:SetScript("OnShow", refreshSettingsPanelState)
-
-    settingsPanel = panel
-    return panel
-end
-
-local function registerSettingsPanel()
-    local panel = createSettingsPanel()
-
-    if Settings and Settings.RegisterCanvasLayoutCategory and Settings.RegisterAddOnCategory then
-        -- Keep the category object and its REAL id (do NOT overwrite category.ID -- that desyncs it
-        -- from Settings' internal registry and breaks Settings.OpenToCategory).
-        settingsCategory = Settings.RegisterCanvasLayoutCategory(panel, "DropChanceTooltip")
-        Settings.RegisterAddOnCategory(settingsCategory)
-        settingsCategoryID = (settingsCategory.GetID and settingsCategory:GetID()) or settingsCategory.ID
-        return
+    for i, section in ipairs(SECTIONS) do
+        local b = CreateFrame("Button", nil, sidebar)
+        b:SetHeight(32)
+        b:SetPoint("TOPLEFT", sidebar, "TOPLEFT", 0, -8 - (i - 1) * 34)
+        b:SetPoint("RIGHT", sidebar, "RIGHT", 0, 0)
+        b._accent = SolidTex(b, "OVERLAY", ACCENT[1], ACCENT[2], ACCENT[3], 1)
+        b._accent:SetPoint("TOPLEFT"); b._accent:SetPoint("BOTTOMLEFT"); b._accent:SetWidth(3); b._accent:Hide()
+        b._hl = SolidTex(b, "BACKGROUND", 1, 1, 1, 0.05); b._hl:SetAllPoints(b); b._hl:Hide()
+        b._label = MakeFont(b, 14, 0.72, 0.72, 0.75); b._label:SetPoint("LEFT", 16, 0); b._label:SetText(section.title)
+        b:SetScript("OnEnter", function() if activeSection ~= section.key then b._hl:Show() end end)
+        b:SetScript("OnLeave", function() if activeSection ~= section.key then b._hl:Hide() end end)
+        b:SetScript("OnClick", function() selectSection(section.key) end)
+        sectionButtons[section.key] = b
     end
 
-    if type(InterfaceOptions_AddCategory) == "function" then
-        InterfaceOptions_AddCategory(panel)
-    end
+    optionsFrame = f
+    return f
 end
 
--- Open the options panel reliably across client variants.
+local function openOptionsWindow()
+    ensureSettings()
+    local f = createOptionsWindow()
+    f:Show()
+    refreshAllFonts()
+    doSelectSection(activeSection or SECTIONS[1].key)
+end
+
+-- Open the options window (slash + bare /dct).
 local function openSettings()
-    createSettingsPanel()
-    if Settings and Settings.OpenToCategory and settingsCategoryID then
-        Settings.OpenToCategory(settingsCategoryID)
+    openOptionsWindow()
+end
+
+-- Register a launcher entry in Blizzard's AddOns settings list that opens our window.
+local function registerSettingsPanel()
+    if not (Settings and Settings.RegisterCanvasLayoutCategory and Settings.RegisterAddOnCategory) then
         return
     end
-    if InterfaceOptionsFrame_OpenToCategory then
-        local panel = createSettingsPanel()
-        InterfaceOptionsFrame_OpenToCategory(panel)
-        InterfaceOptionsFrame_OpenToCategory(panel) -- twice: Blizzard bug workaround
-        return
-    end
-    openSettingsWindow()
+    local panel = CreateFrame("Frame")
+    panel.name = "DropChanceTooltip"
+    local t = panel:CreateFontString(nil, "ARTWORK", "GameFontNormalLarge"); t:SetPoint("TOPLEFT", 16, -16); t:SetText("DropChanceTooltip")
+    local d = panel:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall"); d:SetPoint("TOPLEFT", t, "BOTTOMLEFT", 0, -8); d:SetText("Open the DropChanceTooltip options window.")
+    local b = CreateFrame("Button", nil, panel, "UIPanelButtonTemplate"); b:SetSize(200, 26); b:SetPoint("TOPLEFT", d, "BOTTOMLEFT", 0, -12); b:SetText("Open Options")
+    b:SetScript("OnClick", function() openOptionsWindow() end)
+    settingsCategory = Settings.RegisterCanvasLayoutCategory(panel, "DropChanceTooltip")
+    Settings.RegisterAddOnCategory(settingsCategory)
+    settingsCategoryID = (settingsCategory.GetID and settingsCategory:GetID()) or settingsCategory.ID
 end
 
 -- Keybinding labels (Key Bindings UI, under the "DropChanceTooltip" header).
@@ -3467,6 +3872,33 @@ local function runMatDump(arg)
     if #rows > 40 then out("  ... " .. (#rows - 40) .. " more") end
 end
 
+-- /dct prof [mining|herbalism|skinning] [on|off|override]: per-profession requirement display.
+local function runProfCommand(key, action)
+    ensureSettings()
+    local out = function(m)
+        if DEFAULT_CHAT_FRAME and DEFAULT_CHAT_FRAME.AddMessage then DEFAULT_CHAT_FRAME:AddMessage(m) else print(m) end
+    end
+    local labels = { mining = "Mining", herbalism = "Herbalism", skinning = "Skinning" }
+    key = key and string.lower(key) or nil
+    if not key or not labels[key] then
+        out("|cff66ccffDCT|r profession skill display:")
+        for _, k in ipairs({ "mining", "herbalism", "skinning" }) do
+            local p = DropChanceTooltipDB.professions[k]
+            out(string.format("  %s: enabled=%s override=%s", labels[k], tostring(p.enabled), tostring(p.showWithoutProfession)))
+        end
+        out("usage: /dct prof <mining|herbalism|skinning> on|off|override")
+        return
+    end
+    local p = DropChanceTooltipDB.professions[key]
+    action = action and string.lower(action) or "toggle"
+    if action == "on" then p.enabled = true
+    elseif action == "off" then p.enabled = false
+    elseif action == "override" then p.showWithoutProfession = not p.showWithoutProfession
+    else p.enabled = not p.enabled end
+    if GameTooltip then GameTooltip.__dctNodeSig = nil; GameTooltip.__dctSkinSig = nil end
+    out(string.format("|cff66ccffDCT|r %s: enabled=%s override=%s", labels[key], tostring(p.enabled), tostring(p.showWithoutProfession)))
+end
+
 local function installSlashCommands()
     SLASH_DROPCHANCETOOLTIP1 = "/dct"
     SLASH_DROPCHANCETOOLTIP2 = "/dc"
@@ -3477,6 +3909,11 @@ local function installSlashCommands()
         local args = {}
         for w in string.gmatch(msg or "", "%S+") do args[#args + 1] = w end
         local sub = string.lower(args[1] or "")
+
+        if sub == "prof" then
+            runProfCommand(args[2], args[3])
+            return
+        end
 
         if sub == "npc" then
             runNpcDump(args[2])
@@ -3587,10 +4024,10 @@ local function installSlashCommands()
 
         if DEFAULT_CHAT_FRAME and DEFAULT_CHAT_FRAME.AddMessage then
             DEFAULT_CHAT_FRAME:AddMessage(string.format("|cff66ccffDCT|r Unknown command: %s", command))
-            DEFAULT_CHAT_FRAME:AddMessage("|cff66ccffDCT|r Usage: /dct toggle|on|off | various | count | materials | matmin [%] | mattrash | matdump [id] | npc [id] | gaps [export|clear|test] | settings | debugchat | diag")
+            DEFAULT_CHAT_FRAME:AddMessage("|cff66ccffDCT|r Usage: /dct toggle|on|off | various | count | materials | matmin [%] | mattrash | matdump [id] | npc [id] | gaps [export|clear|test] | prof [mining|herbalism|skinning] | settings | debugchat | diag")
         else
             print(string.format("|cff66ccffDCT|r Unknown command: %s", command))
-            print("|cff66ccffDCT|r Usage: /dct toggle|on|off | various | count | materials | matmin [%] | mattrash | matdump [id] | npc [id] | gaps [export|clear|test] | settings | debugchat | diag")
+            print("|cff66ccffDCT|r Usage: /dct toggle|on|off | various | count | materials | matmin [%] | mattrash | matdump [id] | npc [id] | gaps [export|clear|test] | prof [mining|herbalism|skinning] | settings | debugchat | diag")
         end
     end
 end

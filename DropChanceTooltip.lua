@@ -1765,23 +1765,31 @@ local function renderMaterialAggregation(tooltip, agg, expanded)
         for zone, c in pairs(agg.zones) do zlist[#zlist + 1] = { zone, c } end
         table.sort(zlist, function(a, b) return a[2] > b[2] end)
         if expanded then
-            -- Shift: densest 6 zones with their level range; prune the low-count tail.
+            -- Shift: densest 6 zones, each with its level range right-aligned and colored by
+            -- difficulty vs the player's level. No node counts (not informative).
             local cap = math.min(6, #zlist)
             for i = 1, cap do
-                local z = zlist[i]
-                local lvl = ZONE_LEVELS[z[1]]
-                local label = z[1] .. (lvl and string.format(" (%d-%d)", lvl[1], lvl[2]) or "")
-                tooltip:AddDoubleLine("  " .. label, tostring(z[2]), 1, 1, 1, 0.8, 0.8, 0.8)
+                local zone = zlist[i][1]
+                local lvl = ZONE_LEVELS[zone]
+                if lvl then
+                    local dc = GetQuestDifficultyColor and GetQuestDifficultyColor(lvl[2])
+                    local r, g, b = (dc and dc.r) or 1, (dc and dc.g) or 0.82, (dc and dc.b) or 0
+                    tooltip:AddDoubleLine("  " .. zone, lvl[1] .. "-" .. lvl[2], 0.8, 0.8, 0.8, r, g, b)
+                else
+                    tooltip:AddLine("  " .. zone, 0.8, 0.8, 0.8)
+                end
             end
             if #zlist > cap then
                 tooltip:AddLine("  +" .. (#zlist - cap) .. " more zones", 0.5, 0.5, 0.5)
             end
         else
-            -- Collapsed: just the top 3 zone names (keep the tooltip narrow).
+            -- Collapsed: top 3 zone names on one line; the Shift hint on the line below (narrower).
             local top = {}
             for i = 1, math.min(3, #zlist) do top[#top + 1] = zlist[i][1] end
-            local extra = (#zlist > 3) and ("  (+" .. (#zlist - 3) .. " «Shift»)") or ""
-            tooltip:AddLine("  " .. table.concat(top, ", ") .. extra, 0.8, 0.8, 0.8)
+            tooltip:AddLine("  " .. table.concat(top, ", "), 0.8, 0.8, 0.8)
+            if #zlist > 3 then
+                tooltip:AddLine("  (+" .. (#zlist - 3) .. " «Shift»)", 0.5, 0.5, 0.5)
+            end
         end
         return
     end

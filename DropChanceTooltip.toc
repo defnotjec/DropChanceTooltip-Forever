@@ -17,6 +17,7 @@ Data\QuestieDrops.lua
 Data\GatherNodes.lua
 Data\MobLevels.lua
 Data\SkinningSources.lua
+Data\SkinningLevels.lua
 Data\AlchemyRecipes.lua
 Data\MiningProducts.lua
 

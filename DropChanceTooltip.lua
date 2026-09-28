@@ -1715,6 +1715,11 @@ local function getMaterialAggregation(itemID)
     if CLOTH_ITEMS[itemID] then
         return { kind = "cloth", label = "Humanoids", entries = creatureSourceEntries(itemID) }
     end
+    local slv = DropChanceTooltip_SkinningLevels
+    if slv and slv[itemID] then
+        local r = slv[itemID]
+        return { kind = "leatherrange", label = "Beasts", prof = "Skinning", min = r[1] or r.min, max = r[2] or r.max }
+    end
     local sk = DropChanceTooltip_SkinningSources
     if sk and sk[itemID] then
         local entries = {}
@@ -1734,6 +1739,12 @@ local function renderMaterialAggregation(tooltip, agg, expanded)
                 tooltip:AddDoubleLine("  " .. tostring(r.name or r[1]), "x" .. tostring(r.count or r[2] or 1), 1, 1, 1, 0.8, 0.8, 0.8)
             end
         end
+        return
+    end
+    if agg.kind == "leatherrange" then
+        local rng = (agg.min and agg.max and agg.min ~= agg.max) and (agg.min .. "-" .. agg.max)
+            or tostring(agg.min or agg.max or "?")
+        tooltip:AddDoubleLine(agg.prof or "Skinning", agg.label .. " " .. rng, 1, 0.82, 0, 1, 1, 1)
         return
     end
     if agg.kind == "minestone" then

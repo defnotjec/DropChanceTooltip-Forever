@@ -1712,6 +1712,12 @@ local function getMaterialAggregation(itemID)
         local rec = ar[name]
         return { kind = "alchemy", prof = "Alchemy", skill = rec.skill, reagents = rec.reagents }
     end
+    -- generic crafted items (Tailoring, Engineering, ...): item name -> { prof, skill, reagents }
+    local cr = DropChanceTooltip_CraftRecipes
+    if name and cr and cr[name] then
+        local rec = cr[name]
+        return { kind = "craft", prof = rec.prof, skill = rec.skill, reagents = rec.reagents }
+    end
     if CLOTH_ITEMS[itemID] then
         return { kind = "cloth", label = "Humanoids", entries = creatureSourceEntries(itemID) }
     end
@@ -1763,9 +1769,9 @@ end
 
 local function renderMaterialAggregation(tooltip, agg, expanded)
     tooltip:AddLine(" ")
-    if agg.kind == "alchemy" or agg.kind == "minebar" then
+    if agg.kind == "alchemy" or agg.kind == "minebar" or agg.kind == "craft" then
         local label = (agg.kind == "minebar") and "Smelted" or "Crafted"
-        tooltip:AddDoubleLine(label, agg.skill and (agg.prof .. " " .. agg.skill) or agg.prof, 1, 0.82, 0, 1, 1, 1)
+        tooltip:AddDoubleLine(label, agg.skill and (agg.prof .. " " .. agg.skill) or (agg.prof or "Crafted"), 1, 0.82, 0, 1, 1, 1)
         if expanded and agg.reagents and #agg.reagents > 0 then
             for _, r in ipairs(agg.reagents) do
                 tooltip:AddDoubleLine("  " .. tostring(r.name or r[1]), "x" .. tostring(r.count or r[2] or 1), 1, 1, 1, 0.8, 0.8, 0.8)

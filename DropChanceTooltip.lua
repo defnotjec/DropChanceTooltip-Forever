@@ -1579,6 +1579,22 @@ local ORE_SKILL = {
     ["Ooze Covered Thorium Vein"]=245,
 }
 
+-- Classic zone level ranges (small fixed table; keys match the GatherNodes zone names). Cities omitted.
+local ZONE_LEVELS = {
+    ["Durotar"]={1,10}, ["Mulgore"]={1,10}, ["Elwynn Forest"]={1,10}, ["Dun Morogh"]={1,10},
+    ["Tirisfal Glades"]={1,10}, ["Teldrassil"]={1,10},
+    ["The Barrens"]={10,25}, ["Silverpine Forest"]={10,20}, ["Westfall"]={10,20}, ["Loch Modan"]={10,20},
+    ["Darkshore"]={10,20}, ["Redridge Mountains"]={15,25}, ["Stonetalon Mountains"]={15,27},
+    ["Duskwood"]={18,30}, ["Ashenvale"]={18,30}, ["Hillsbrad Foothills"]={20,30}, ["Wetlands"]={20,30},
+    ["Thousand Needles"]={25,35}, ["Arathi Highlands"]={30,40}, ["Desolace"]={30,40},
+    ["Alterac Mountains"]={30,40}, ["Stranglethorn Vale"]={30,45}, ["Dustwallow Marsh"]={35,45},
+    ["Badlands"]={35,45}, ["Swamp of Sorrows"]={35,45}, ["The Hinterlands"]={40,50}, ["Tanaris"]={40,50},
+    ["Feralas"]={40,50}, ["Azshara"]={45,55}, ["Searing Gorge"]={45,50}, ["Blasted Lands"]={45,55},
+    ["Un'Goro Crater"]={48,55}, ["Felwood"]={48,55}, ["Western Plaguelands"]={51,58},
+    ["Burning Steppes"]={50,58}, ["Deadwind Pass"]={55,60}, ["Eastern Plaguelands"]={53,60},
+    ["Winterspring"]={53,60}, ["Silithus"]={55,60},
+}
+
 -- Creature source entries {npcID, pct?} that drop an item, from LootDBLua (pct = drop chance %).
 local function creatureSourceEntries(itemID)
     local sources = getSources(itemID)
@@ -1738,13 +1754,22 @@ local function renderMaterialAggregation(tooltip, agg, expanded)
         for zone, c in pairs(agg.zones) do zlist[#zlist + 1] = { zone, c } end
         table.sort(zlist, function(a, b) return a[2] > b[2] end)
         if expanded then
-            for _, z in ipairs(zlist) do
-                tooltip:AddDoubleLine("  " .. z[1], tostring(z[2]), 1, 1, 1, 0.8, 0.8, 0.8)
+            -- Shift: densest 6 zones with their level range; prune the low-count tail.
+            local cap = math.min(6, #zlist)
+            for i = 1, cap do
+                local z = zlist[i]
+                local lvl = ZONE_LEVELS[z[1]]
+                local label = z[1] .. (lvl and string.format(" (%d-%d)", lvl[1], lvl[2]) or "")
+                tooltip:AddDoubleLine("  " .. label, tostring(z[2]), 1, 1, 1, 0.8, 0.8, 0.8)
+            end
+            if #zlist > cap then
+                tooltip:AddLine("  +" .. (#zlist - cap) .. " more zones", 0.5, 0.5, 0.5)
             end
         else
+            -- Collapsed: just the top 3 zone names (keep the tooltip narrow).
             local top = {}
-            for i = 1, math.min(4, #zlist) do top[#top + 1] = zlist[i][1] end
-            local extra = (#zlist > 4) and ("  (+" .. (#zlist - 4) .. " «Shift»)") or ""
+            for i = 1, math.min(3, #zlist) do top[#top + 1] = zlist[i][1] end
+            local extra = (#zlist > 3) and ("  (+" .. (#zlist - 3) .. " «Shift»)") or ""
             tooltip:AddLine("  " .. table.concat(top, ", ") .. extra, 0.8, 0.8, 0.8)
         end
         return

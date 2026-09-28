@@ -1681,6 +1681,11 @@ local function getMaterialAggregation(itemID)
         end
         if next(zones) then return { kind = "ore", prof = "Mining", skill = skill, zones = zones } end
     end
+    local ar = DropChanceTooltip_AlchemyRecipes
+    if name and ar and ar[name] then
+        local rec = ar[name]
+        return { kind = "alchemy", prof = "Alchemy", skill = rec.skill, reagents = rec.reagents }
+    end
     if CLOTH_ITEMS[itemID] then
         return { kind = "cloth", label = "Humanoids", entries = creatureSourceEntries(itemID) }
     end
@@ -1695,6 +1700,15 @@ end
 
 local function renderMaterialAggregation(tooltip, agg, expanded)
     tooltip:AddLine(" ")
+    if agg.kind == "alchemy" then
+        tooltip:AddDoubleLine("Crafted", agg.skill and ("Alchemy " .. agg.skill) or "Alchemy", 1, 0.82, 0, 1, 1, 1)
+        if expanded and agg.reagents and #agg.reagents > 0 then
+            for _, r in ipairs(agg.reagents) do
+                tooltip:AddDoubleLine("  " .. tostring(r.name or r[1]), "x" .. tostring(r.count or r[2] or 1), 1, 1, 1, 0.8, 0.8, 0.8)
+            end
+        end
+        return
+    end
     if agg.kind == "herb" or agg.kind == "ore" then
         local right = agg.skill and (agg.prof .. " " .. agg.skill) or agg.prof
         tooltip:AddDoubleLine("Gathered", right, 1, 0.82, 0, 1, 1, 1)

@@ -17,6 +17,7 @@ Data\QuestieDrops.lua
 Data\GatherNodes.lua
 Data\MobLevels.lua
 Data\SkinningSources.lua
+Data\AlchemyRecipes.lua
 
 # Bindings.xml is auto-loaded from the addon folder by this client; do NOT list it here
 # (listing it double-loads and throws "Unrecognized XML: Binding" on login).

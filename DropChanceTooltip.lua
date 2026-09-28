@@ -1746,6 +1746,21 @@ local function diffRange(lo, hi)
     return colorLevel(hi or lo)
 end
 
+-- Zones whose level range OVERLAPS [lo,hi], sorted by zone level. Used to suggest where to farm a
+-- creature-sourced material (leather beasts): GatherMate has no beast data, but a zone's level ~= the
+-- level of the beasts in it, so level-matched zones are a good "where to skin this" proxy.
+local function zonesForLevelRange(lo, hi)
+    if not (lo and hi) then return {} end
+    local out = {}
+    for zone, lv in pairs(ZONE_LEVELS) do
+        if lv[1] <= hi and lv[2] >= lo then
+            out[#out + 1] = { zone = zone, lo = lv[1], hi = lv[2] }
+        end
+    end
+    table.sort(out, function(a, b) return a.lo < b.lo or (a.lo == b.lo and a.hi < b.hi) end)
+    return out
+end
+
 local function renderMaterialAggregation(tooltip, agg, expanded)
     tooltip:AddLine(" ")
     if agg.kind == "alchemy" or agg.kind == "minebar" then
@@ -1760,6 +1775,18 @@ local function renderMaterialAggregation(tooltip, agg, expanded)
     end
     if agg.kind == "leatherrange" then
         tooltip:AddDoubleLine(agg.prof or "Skinning", agg.label .. " " .. diffRange(agg.min, agg.max), 1, 0.82, 0, 1, 1, 1)
+        if expanded then
+            -- Where to skin it: zones whose level matches the beast range (level-based, not exact).
+            local zones = zonesForLevelRange(agg.min, agg.max)
+            local cap = math.min(6, #zones)
+            for i = 1, cap do
+                local z = zones[i]
+                tooltip:AddDoubleLine("  " .. z.zone, diffRange(z.lo, z.hi), 0.8, 0.8, 0.8, 1, 1, 1)
+            end
+            if #zones > cap then
+                tooltip:AddLine("  +" .. (#zones - cap) .. " more zones", 0.5, 0.5, 0.5)
+            end
+        end
         return
     end
     if agg.kind == "minestone" then
@@ -1825,7 +1852,7 @@ local function renderMaterialAggregation(tooltip, agg, expanded)
                 right = band.count .. (band.count == 1 and " mob" or " mobs")
             end
             local btop = math.min(b + width, hi or (b + width))   -- never overshoot the real max
-            tooltip:AddDoubleLine(string.format("  %d-%d", b, btop), right, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8)
+            tooltip:AddDoubleLine("  " .. diffRange(b, btop), right, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8)
         end
     end
 end

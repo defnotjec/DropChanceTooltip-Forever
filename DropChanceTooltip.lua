@@ -1729,6 +1729,18 @@ local function getMaterialAggregation(itemID)
     return nil
 end
 
+-- "lo-hi" (or a single level) colored by difficulty of the top level vs the player.
+local function diffRange(lo, hi)
+    local top = hi or lo
+    local text = (lo and hi and lo ~= hi) and (lo .. "-" .. hi) or tostring(top or "?")
+    local dc = top and GetQuestDifficultyColor and GetQuestDifficultyColor(top)
+    if dc then
+        return string.format("|cff%02x%02x%02x%s|r",
+            math.floor((dc.r or 1) * 255), math.floor((dc.g or 1) * 255), math.floor((dc.b or 1) * 255), text)
+    end
+    return text
+end
+
 local function renderMaterialAggregation(tooltip, agg, expanded)
     tooltip:AddLine(" ")
     if agg.kind == "alchemy" or agg.kind == "minebar" then
@@ -1742,9 +1754,7 @@ local function renderMaterialAggregation(tooltip, agg, expanded)
         return
     end
     if agg.kind == "leatherrange" then
-        local rng = (agg.min and agg.max and agg.min ~= agg.max) and (agg.min .. "-" .. agg.max)
-            or tostring(agg.min or agg.max or "?")
-        tooltip:AddDoubleLine(agg.prof or "Skinning", agg.label .. " " .. rng, 1, 0.82, 0, 1, 1, 1)
+        tooltip:AddDoubleLine(agg.prof or "Skinning", agg.label .. " " .. diffRange(agg.min, agg.max), 1, 0.82, 0, 1, 1, 1)
         return
     end
     if agg.kind == "minestone" then
@@ -1796,7 +1806,7 @@ local function renderMaterialAggregation(tooltip, agg, expanded)
 
     -- cloth / leather: normal-mob type + level range (rares/elites and the low-% tail excluded)
     local lo, hi, bands, width = analyzeCreatureSources(agg.entries)
-    local rangeText = (lo and hi) and (agg.label .. " " .. lo .. "-" .. hi) or agg.label
+    local rangeText = (lo and hi) and (agg.label .. " " .. diffRange(lo, hi)) or agg.label
     tooltip:AddDoubleLine(agg.prof or "Source", rangeText, 1, 0.82, 0, 1, 1, 1)
     if expanded and bands and next(bands) then
         local starts = {}

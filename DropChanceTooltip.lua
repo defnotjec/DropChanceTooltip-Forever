@@ -1729,16 +1729,21 @@ local function getMaterialAggregation(itemID)
     return nil
 end
 
--- "lo-hi" (or a single level) colored by difficulty of the top level vs the player.
+-- One level, colored by its difficulty vs the player (green..red).
+local function colorLevel(level)
+    local dc = level and GetQuestDifficultyColor and GetQuestDifficultyColor(level)
+    if not dc then return tostring(level or "?") end
+    return string.format("|cff%02x%02x%02x%s|r",
+        math.floor((dc.r or 1) * 255), math.floor((dc.g or 1) * 255), math.floor((dc.b or 1) * 255), tostring(level))
+end
+
+-- "lo-hi" with the min and max EACH colored by their own difficulty, so a wide band (e.g. 11-23)
+-- reads green at the low end and red at the high end instead of one flat color.
 local function diffRange(lo, hi)
-    local top = hi or lo
-    local text = (lo and hi and lo ~= hi) and (lo .. "-" .. hi) or tostring(top or "?")
-    local dc = top and GetQuestDifficultyColor and GetQuestDifficultyColor(top)
-    if dc then
-        return string.format("|cff%02x%02x%02x%s|r",
-            math.floor((dc.r or 1) * 255), math.floor((dc.g or 1) * 255), math.floor((dc.b or 1) * 255), text)
+    if lo and hi and lo ~= hi then
+        return colorLevel(lo) .. "-" .. colorLevel(hi)
     end
-    return text
+    return colorLevel(hi or lo)
 end
 
 local function renderMaterialAggregation(tooltip, agg, expanded)
@@ -1782,9 +1787,7 @@ local function renderMaterialAggregation(tooltip, agg, expanded)
                 local zone = zlist[i][1]
                 local lvl = ZONE_LEVELS[zone]
                 if lvl then
-                    local dc = GetQuestDifficultyColor and GetQuestDifficultyColor(lvl[2])
-                    local r, g, b = (dc and dc.r) or 1, (dc and dc.g) or 0.82, (dc and dc.b) or 0
-                    tooltip:AddDoubleLine("  " .. zone, lvl[1] .. "-" .. lvl[2], 0.8, 0.8, 0.8, r, g, b)
+                    tooltip:AddDoubleLine("  " .. zone, diffRange(lvl[1], lvl[2]), 0.8, 0.8, 0.8, 1, 1, 1)
                 else
                     tooltip:AddLine("  " .. zone, 0.8, 0.8, 0.8)
                 end

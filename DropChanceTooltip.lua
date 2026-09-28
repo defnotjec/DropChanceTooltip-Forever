@@ -1681,6 +1681,16 @@ local function getMaterialAggregation(itemID)
         end
         if next(zones) then return { kind = "ore", prof = "Mining", skill = skill, zones = zones } end
     end
+    local mb = DropChanceTooltip_MiningBars
+    if name and mb and mb[name] then
+        local rec = mb[name]
+        return { kind = "minebar", prof = "Mining", skill = rec.skill, reagents = rec.reagents }
+    end
+    local ms = DropChanceTooltip_MiningStone
+    if name and ms and ms[name] then
+        local rec = ms[name]
+        return { kind = "minestone", prof = "Mining", min = rec.min, max = rec.max, ores = rec.ores }
+    end
     local ar = DropChanceTooltip_AlchemyRecipes
     if name and ar and ar[name] then
         local rec = ar[name]
@@ -1700,11 +1710,23 @@ end
 
 local function renderMaterialAggregation(tooltip, agg, expanded)
     tooltip:AddLine(" ")
-    if agg.kind == "alchemy" then
-        tooltip:AddDoubleLine("Crafted", agg.skill and ("Alchemy " .. agg.skill) or "Alchemy", 1, 0.82, 0, 1, 1, 1)
+    if agg.kind == "alchemy" or agg.kind == "minebar" then
+        local label = (agg.kind == "minebar") and "Smelted" or "Crafted"
+        tooltip:AddDoubleLine(label, agg.skill and (agg.prof .. " " .. agg.skill) or agg.prof, 1, 0.82, 0, 1, 1, 1)
         if expanded and agg.reagents and #agg.reagents > 0 then
             for _, r in ipairs(agg.reagents) do
                 tooltip:AddDoubleLine("  " .. tostring(r.name or r[1]), "x" .. tostring(r.count or r[2] or 1), 1, 1, 1, 0.8, 0.8, 0.8)
+            end
+        end
+        return
+    end
+    if agg.kind == "minestone" then
+        local rng = (agg.min and agg.max and agg.min ~= agg.max) and (agg.min .. "-" .. agg.max)
+            or tostring(agg.min or agg.max or "?")
+        tooltip:AddDoubleLine("Mined", "Mining " .. rng, 1, 0.82, 0, 1, 1, 1)
+        if expanded and agg.ores and #agg.ores > 0 then
+            for _, o in ipairs(agg.ores) do
+                tooltip:AddLine("  " .. tostring(o), 0.8, 0.8, 0.8)
             end
         end
         return

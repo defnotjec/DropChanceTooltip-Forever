@@ -2328,6 +2328,10 @@ local function addSkinningInfoToTooltip(tooltip)
 
     local unit = (UnitExists and UnitExists("mouseover")) and "mouseover" or nil
     if not unit then return end
+    -- Only real NPC creatures are skinnable. Guard on a Creature GUID so we never inject onto a
+    -- PLAYER (a shapeshifted druid -- self or others -- reports UnitCreatureType "Beast") or a pet.
+    local guid = UnitGUID and UnitGUID(unit)
+    if not guid or (strsplit("-", guid)) ~= "Creature" then return end
     if not (UnitCreatureType and UnitCreatureType(unit) == "Beast") then return end
 
     local level = UnitLevel and UnitLevel(unit)

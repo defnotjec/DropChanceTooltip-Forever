@@ -1,0 +1,23 @@
+All Rights Reserved
+
+Copyright (c) 2026 defnotjec
+
+This repository is a personal port and enhancement of "DropRateTooltip"
+(formerly "DropChanceTooltip") and "LootDBLua" by astroVermilion:
+  https://www.curseforge.com/wow/addons/dropratetooltip
+  https://www.curseforge.com/wow/addons/lootdblua
+
+No license is granted. You may NOT copy, redistribute, republish, mirror,
+sublicense, sell, or create derivative works from any part of this repository —
+including the port's source code and the bundled, independently-generated data
+tables in Data/ — without the express written permission of the copyright
+holder.
+
+Viewing the source on the hosting platform for reference is permitted; reuse is
+not. Original upstream code and the LootDBLua database remain the property of
+astroVermilion under their own terms, and are not redistributed here.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED. IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES, OR
+OTHER LIABILITY ARISING FROM, OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR ITS
+USE.

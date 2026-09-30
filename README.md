@@ -4,9 +4,11 @@ Adds **drop-chance and drop-source information to item and mob tooltips** on the
 **WoW: Forever** client (Interface `16001`), plus owned-item counts across your
 characters and a material-source summariser for gathered/crafted goods.
 
-This is a port and substantial enhancement of **astroVermilion's**
-`DropChanceTooltip`, which targeted TBC (Interface `20504`) and no longer loads on
-Forever. It reads its loot data from **LootDBLua** (also by astroVermilion).
+This is a port and substantial enhancement of astroVermilion's
+[DropRateTooltip](https://www.curseforge.com/wow/addons/dropratetooltip) (formerly
+DropChanceTooltip), which targeted TBC (Interface `20504`) and no longer loads on
+Forever. It reads its loot data from
+[LootDBLua](https://www.curseforge.com/wow/addons/lootdblua) (also by astroVermilion).
 
 > [!IMPORTANT]
 > **This addon requires [LootDBLua](#requirements--installation).** It is a hard
@@ -41,7 +43,7 @@ Forever. It reads its loot data from **LootDBLua** (also by astroVermilion).
 | Requirement | Notes |
 |---|---|
 | **WoW: Forever client** | Interface `16001`. |
-| **[LootDBLua](https://github.com/) by astroVermilion** | **Required.** The item→source loot database (~10 MB). DropChanceTooltip reads it at runtime; it is never modified. |
+| **[LootDBLua](https://www.curseforge.com/wow/addons/lootdblua) by astroVermilion** | **Required.** The item→source loot database (~10 MB). DropChanceTooltip reads it at runtime; it is never modified. |
 
 **Install:**
 
@@ -233,10 +235,13 @@ What this version changes versus astroVermilion's original:
 
 ## Attribution & license
 
-Original **DropChanceTooltip** and **LootDBLua** by **astroVermilion**. This is a
-personal Forever port and enhancement.
+Original **[DropRateTooltip](https://www.curseforge.com/wow/addons/dropratetooltip)**
+(formerly DropChanceTooltip) and
+**[LootDBLua](https://www.curseforge.com/wow/addons/lootdblua)** by **astroVermilion**.
+This is a personal Forever port and enhancement.
 
-> Upstream carries no explicit license in the distributed files. **Do not
-> redistribute LootDBLua** (or upstream code) without confirming the original
-> author's license and preserving attribution. This repository distributes only the
-> port's own code and the bundled, independently-generated `Data/` tables.
+**All rights reserved** — see [`LICENSE`](LICENSE). No license is granted: you may
+not copy, redistribute, republish, or create derivative works from this repository's
+code or bundled `Data/` tables without the author's express permission. This
+repository distributes only the port's own code and its independently-generated data
+— **not** LootDBLua, which remains astroVermilion's under their own CurseForge terms.

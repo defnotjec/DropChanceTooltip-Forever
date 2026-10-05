@@ -2277,6 +2277,11 @@ local function findTooltipLine(tooltip, needle)
     return nil
 end
 
+-- On this client some tooltip text and unit GUIDs are "secret" values (e.g. inside instances):
+-- indexing a table with one or converting one to a string throws. Bail whenever a value is secret
+-- (gather nodes / skinnable beasts don't exist in those contexts anyway).
+local issecretvalue = issecretvalue or function() return false end
+
 -- Object(4) tooltip: Mining/Herbalism gather nodes. Detected by node name (nodes carry no id).
 -- Injects the required skill into the game's "Requires Mining/Herbalism" line as a difficulty-colored
 -- "(N)"; adds the line if the game didn't render one. Node names match ORE_SKILL (vein names) and
@@ -2286,7 +2291,7 @@ local function addGatherNodeInfoToTooltip(tooltip)
     if DropChanceTooltipDB and DropChanceTooltipDB.enabled == false then return end
     local nameFS = tooltip.GetName and _G[tooltip:GetName() .. "TextLeft1"]
     local nodeName = nameFS and nameFS:GetText()
-    if not nodeName then return end
+    if not nodeName or issecretvalue(nodeName) then return end
 
     local key, profName, req, needle
     if ORE_SKILL[nodeName] then
@@ -2331,7 +2336,8 @@ local function addSkinningInfoToTooltip(tooltip)
     -- Only real NPC creatures are skinnable. Guard on a Creature GUID so we never inject onto a
     -- PLAYER (a shapeshifted druid -- self or others -- reports UnitCreatureType "Beast") or a pet.
     local guid = UnitGUID and UnitGUID(unit)
-    if not guid or (strsplit("-", guid)) ~= "Creature" then return end
+    if not guid or issecretvalue(guid) then return end   -- secret GUID (e.g. in instances): bail
+    if (strsplit("-", guid)) ~= "Creature" then return end
     if not (UnitCreatureType and UnitCreatureType(unit) == "Beast") then return end
 
     local level = UnitLevel and UnitLevel(unit)
